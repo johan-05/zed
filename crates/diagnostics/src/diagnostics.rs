@@ -4,6 +4,7 @@ mod toolbar_controls;
 
 #[cfg(test)]
 mod diagnostics_tests;
+mod grouped_diagnostics;
 
 use anyhow::Result;
 use collections::{BTreeSet, HashSet};
@@ -14,6 +15,7 @@ use editor::{
     scroll::Autoscroll,
     Editor, EditorEvent, ExcerptId, ExcerptRange, MultiBuffer, ToOffset,
 };
+use feature_flags::FeatureFlagAppExt;
 use futures::{
     channel::mpsc::{self, UnboundedSender},
     StreamExt as _,
@@ -43,7 +45,7 @@ use ui::{h_flex, prelude::*, Icon, IconName, Label};
 use util::ResultExt;
 use workspace::{
     item::{BreadcrumbText, Item, ItemEvent, ItemHandle, TabContentParams},
-    ItemNavHistory, Pane, ToolbarItemLocation, Workspace,
+    ItemNavHistory, ToolbarItemLocation, Workspace,
 };
 
 actions!(diagnostics, [Deploy, ToggleWarnings]);
@@ -52,6 +54,9 @@ pub fn init(cx: &mut AppContext) {
     ProjectDiagnosticsSettings::register(cx);
     cx.observe_new_views(ProjectDiagnosticsEditor::register)
         .detach();
+    if !cx.has_flag::<feature_flags::GroupedDiagnostics>() {
+        grouped_diagnostics::init(cx);
+    }
 }
 
 struct ProjectDiagnosticsEditor {
@@ -466,7 +471,9 @@ impl ProjectDiagnosticsEditor {
                                         position: (excerpt_id, entry.range.start),
                                         height: diagnostic.message.matches('\n').count() as u8 + 1,
                                         style: BlockStyle::Fixed,
-                                        render: diagnostic_block_renderer(diagnostic, true),
+                                        render: diagnostic_block_renderer(
+                                            diagnostic, None, true, true,
+                                        ),
                                         disposition: BlockDisposition::Below,
                                     });
                                 }
@@ -779,26 +786,12 @@ impl Item for ProjectDiagnosticsEditor {
         self.editor
             .update(cx, |editor, cx| editor.added_to_workspace(workspace, cx));
     }
-
-    fn serialized_item_kind() -> Option<&'static str> {
-        Some("diagnostics")
-    }
-
-    fn deserialize(
-        project: Model<Project>,
-        workspace: WeakView<Workspace>,
-        _workspace_id: workspace::WorkspaceId,
-        _item_id: workspace::ItemId,
-        cx: &mut ViewContext<Pane>,
-    ) -> Task<Result<View<Self>>> {
-        Task::ready(Ok(cx.new_view(|cx| Self::new(project, workspace, cx))))
-    }
 }
 
 const DIAGNOSTIC_HEADER: &'static str = "diagnostic header";
 
 fn diagnostic_header_renderer(diagnostic: Diagnostic) -> RenderBlock {
-    let (message, code_ranges) = highlight_diagnostic_message(&diagnostic);
+    let (message, code_ranges) = highlight_diagnostic_message(&diagnostic, None);
     let message: SharedString = message;
     Box::new(move |cx| {
         let highlight_style: HighlightStyle = cx.theme().colors().text_accent.into();
