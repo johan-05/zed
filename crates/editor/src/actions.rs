@@ -129,7 +129,7 @@ pub struct ExpandExcerptsDown {
 #[derive(PartialEq, Clone, Deserialize, Default)]
 pub struct ShowCompletions {
     #[serde(default)]
-    pub(super) trigger: Option<char>,
+    pub(super) trigger: Option<String>,
 }
 
 impl_actions!(
@@ -210,6 +210,8 @@ gpui::actions!(
         Format,
         GoToDefinition,
         GoToDefinitionSplit,
+        GoToDeclaration,
+        GoToDeclarationSplit,
         GoToDiagnostic,
         GoToHunk,
         GoToImplementation,

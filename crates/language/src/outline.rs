@@ -1,8 +1,6 @@
+use crate::{BufferSnapshot, Point, ToPoint};
 use fuzzy::{StringMatch, StringMatchCandidate};
-use gpui::{
-    relative, AppContext, BackgroundExecutor, FontStyle, HighlightStyle, StyledText, TextStyle,
-    WhiteSpace,
-};
+use gpui::{relative, AppContext, BackgroundExecutor, HighlightStyle, StyledText, TextStyle};
 use settings::Settings;
 use std::ops::Range;
 use theme::{color_alpha, ActiveTheme, ThemeSettings};
@@ -23,6 +21,29 @@ pub struct OutlineItem<T> {
     pub text: String,
     pub highlight_ranges: Vec<(Range<usize>, HighlightStyle)>,
     pub name_ranges: Vec<Range<usize>>,
+    pub body_range: Option<Range<T>>,
+    pub annotation_range: Option<Range<T>>,
+}
+
+impl<T: ToPoint> OutlineItem<T> {
+    /// Converts to an equivalent outline item, but with parameterized over Points.
+    pub fn to_point(&self, buffer: &BufferSnapshot) -> OutlineItem<Point> {
+        OutlineItem {
+            depth: self.depth,
+            range: self.range.start.to_point(buffer)..self.range.end.to_point(buffer),
+            text: self.text.clone(),
+            highlight_ranges: self.highlight_ranges.clone(),
+            name_ranges: self.name_ranges.clone(),
+            body_range: self
+                .body_range
+                .as_ref()
+                .map(|r| r.start.to_point(buffer)..r.end.to_point(buffer)),
+            annotation_range: self
+                .annotation_range
+                .as_ref()
+                .map(|r| r.start.to_point(buffer)..r.end.to_point(buffer)),
+        }
+    }
 }
 
 impl<T> Outline<T> {
@@ -63,6 +84,16 @@ impl<T> Outline<T> {
         }
     }
 
+    /// Find the most similar symbol to the provided query according to the Jaro-Winkler distance measure.
+    pub fn find_most_similar(&self, query: &str) -> Option<&OutlineItem<T>> {
+        let candidate = self.path_candidates.iter().max_by(|a, b| {
+            strsim::jaro_winkler(&a.string, query)
+                .total_cmp(&strsim::jaro_winkler(&b.string, query))
+        })?;
+        Some(&self.items[candidate.id])
+    }
+
+    /// Find all outline symbols according to a longest subsequence match with the query, ordered descending by match score.
     pub async fn search(&self, query: &str, executor: BackgroundExecutor) -> Vec<StringMatch> {
         let query = query.trim_start();
         let is_path_query = query.contains(' ');
@@ -164,14 +195,11 @@ pub fn render_item<T>(
         color: cx.theme().colors().text,
         font_family: settings.buffer_font.family.clone(),
         font_features: settings.buffer_font.features.clone(),
+        font_fallbacks: settings.buffer_font.fallbacks.clone(),
         font_size: settings.buffer_font_size(cx).into(),
         font_weight: settings.buffer_font.weight,
-        font_style: FontStyle::Normal,
         line_height: relative(1.),
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-        white_space: WhiteSpace::Normal,
+        ..Default::default()
     };
     let highlights = gpui::combine_highlights(
         custom_highlights,

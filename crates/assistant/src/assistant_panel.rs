@@ -1,55 +1,70 @@
 use crate::{
     assistant_settings::{AssistantDockPosition, AssistantSettings},
-    humanize_token_count, parse_next_edit_suggestion,
+    humanize_token_count,
     prompt_library::open_prompt_library,
-    search::*,
+    prompts::PromptBuilder,
     slash_command::{
         default_command::DefaultSlashCommand,
         docs_command::{DocsSlashCommand, DocsSlashCommandArgs},
         SlashCommandCompletionProvider, SlashCommandRegistry,
     },
     terminal_inline_assistant::TerminalInlineAssistant,
-    ApplyEdit, Assist, CompletionProvider, ConfirmCommand, Context, ContextEvent, ContextId,
-    ContextStore, CycleMessageRole, DeployHistory, DeployPromptLibrary, EditSuggestion,
-    InlineAssist, InlineAssistant, InsertIntoEditor, MessageStatus, ModelSelector,
+    Assist, CodegenStatus, ConfirmCommand, Context, ContextEvent, ContextId, ContextStore,
+    CycleMessageRole, DebugEditSteps, DeployHistory, DeployPromptLibrary, EditSuggestionGroup,
+    InlineAssist, InlineAssistId, InlineAssistant, InsertIntoEditor, MessageStatus, ModelSelector,
     PendingSlashCommand, PendingSlashCommandStatus, QuoteSelection, RemoteContextMetadata,
-    ResetKey, Role, SavedContextMetadata, Split, ToggleFocus, ToggleModelSelector,
+    ResolvedWorkflowStepEditSuggestions, SavedContextMetadata, Split, ToggleFocus,
+    ToggleModelSelector, WorkflowStepEditSuggestions,
 };
+use crate::{ContextStoreEvent, ShowConfiguration};
 use anyhow::{anyhow, Result};
 use assistant_slash_command::{SlashCommand, SlashCommandOutputSection};
-use breadcrumbs::Breadcrumbs;
-use client::proto;
+use client::{proto, Client, Status};
 use collections::{BTreeSet, HashMap, HashSet};
 use editor::{
     actions::{FoldAt, MoveToEndOfLine, Newline, ShowCompletions, UnfoldAt},
     display_map::{
-        BlockDisposition, BlockId, BlockProperties, BlockStyle, Crease, RenderBlock, ToDisplayPoint,
+        BlockDisposition, BlockProperties, BlockStyle, Crease, CustomBlockId, RenderBlock,
+        ToDisplayPoint,
     },
-    scroll::{Autoscroll, AutoscrollStrategy},
-    Anchor, Editor, EditorEvent, RowExt, ToOffset as _, ToPoint,
+    scroll::{Autoscroll, AutoscrollStrategy, ScrollAnchor},
+    Anchor, Editor, EditorEvent, ExcerptRange, MultiBuffer, RowExt, ToOffset as _, ToPoint,
 };
 use editor::{display_map::CreaseId, FoldPlaceholder};
 use fs::Fs;
 use gpui::{
     div, percentage, point, Action, Animation, AnimationExt, AnyElement, AnyView, AppContext,
-    AsyncWindowContext, ClipboardItem, DismissEvent, Empty, EventEmitter, FocusHandle,
-    FocusableView, InteractiveElement, IntoElement, Model, ParentElement, Pixels, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Transformation,
-    UpdateGlobal, View, ViewContext, VisualContext, WeakView, WindowContext,
+    AsyncWindowContext, ClipboardItem, Context as _, DismissEvent, Empty, Entity, EventEmitter,
+    FocusHandle, FocusableView, FontWeight, InteractiveElement, IntoElement, Model, ParentElement,
+    Pixels, ReadGlobal, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    Task, Transformation, UpdateGlobal, View, ViewContext, VisualContext, WeakView, WindowContext,
 };
 use indexed_docs::IndexedDocsStore;
 use language::{
-    language_settings::SoftWrap, AutoindentMode, Buffer, LanguageRegistry, LspAdapterDelegate,
-    OffsetRangeExt as _, Point, ToOffset,
+    language_settings::SoftWrap, Buffer, Capability, LanguageRegistry, LspAdapterDelegate, Point,
+    ToOffset,
+};
+use language_model::{
+    provider::cloud::PROVIDER_ID, LanguageModelProvider, LanguageModelProviderId,
+    LanguageModelRegistry, Role,
 };
 use multi_buffer::MultiBufferRow;
 use picker::{Picker, PickerDelegate};
-use project::{Project, ProjectLspAdapterDelegate, ProjectTransaction};
+use project::{Project, ProjectLspAdapterDelegate};
 use search::{buffer_search::DivRegistrar, BufferSearchBar};
-use settings::Settings;
-use std::{cmp, fmt::Write, ops::Range, path::PathBuf, sync::Arc, time::Duration};
+use settings::{update_settings_file, Settings};
+use smol::stream::StreamExt;
+use std::{
+    borrow::Cow,
+    cmp::{self, Ordering},
+    fmt::Write,
+    ops::Range,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 use terminal_view::{terminal_panel::TerminalPanel, TerminalView};
-use theme::ThemeSettings;
+use ui::TintColor;
 use ui::{
     prelude::*,
     utils::{format_distance_from_now, DateTimeType},
@@ -59,8 +74,9 @@ use ui::{
 use util::ResultExt;
 use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
-    item::{self, BreadcrumbText, FollowableItem, Item, ItemHandle},
-    pane,
+    item::{self, FollowableItem, Item, ItemHandle},
+    notifications::NotifyTaskExt,
+    pane::{self, SaveIntent},
     searchable::{SearchEvent, SearchableItem},
     Pane, Save, ToggleZoom, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace,
 };
@@ -81,10 +97,36 @@ pub fn init(cx: &mut AppContext) {
                 })
                 .register_action(AssistantPanel::inline_assist)
                 .register_action(ContextEditor::quote_selection)
-                .register_action(ContextEditor::insert_selection);
+                .register_action(ContextEditor::insert_selection)
+                .register_action(AssistantPanel::show_configuration);
         },
     )
     .detach();
+
+    cx.observe_new_views(
+        |terminal_panel: &mut TerminalPanel, cx: &mut ViewContext<TerminalPanel>| {
+            let settings = AssistantSettings::get_global(cx);
+            if !settings.enabled {
+                return;
+            }
+
+            terminal_panel.register_tab_bar_button(cx.new_view(|_| InlineAssistTabBarButton), cx);
+        },
+    )
+    .detach();
+}
+
+struct InlineAssistTabBarButton;
+
+impl Render for InlineAssistTabBarButton {
+    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+        IconButton::new("terminal_inline_assistant", IconName::MagicWand)
+            .icon_size(IconSize::Small)
+            .on_click(cx.listener(|_, _, cx| {
+                cx.dispatch_action(InlineAssist::default().boxed_clone());
+            }))
+            .tooltip(move |cx| Tooltip::for_action("Inline Assist", &InlineAssist::default(), cx))
+    }
 }
 
 pub enum AssistantPanelEvent {
@@ -101,8 +143,13 @@ pub struct AssistantPanel {
     languages: Arc<LanguageRegistry>,
     fs: Arc<dyn Fs>,
     subscriptions: Vec<Subscription>,
-    authentication_prompt: Option<AnyView>,
     model_selector_menu_handle: PopoverMenuHandle<ContextMenu>,
+    model_summary_editor: View<Editor>,
+    authenticate_provider_task: Option<(LanguageModelProviderId, Task<()>)>,
+    configuration_subscription: Option<Subscription>,
+    client_status: Option<client::Status>,
+    watch_client_status: Option<Task<()>>,
+    show_zed_ai_notice: bool,
 }
 
 #[derive(Clone)]
@@ -269,14 +316,17 @@ impl PickerDelegate for SavedContextPickerDelegate {
 impl AssistantPanel {
     pub fn load(
         workspace: WeakView<Workspace>,
+        prompt_builder: Arc<PromptBuilder>,
         cx: AsyncWindowContext,
     ) -> Task<Result<View<Self>>> {
         cx.spawn(|mut cx| async move {
             let context_store = workspace
                 .update(&mut cx, |workspace, cx| {
-                    ContextStore::new(workspace.project().clone(), cx)
+                    let project = workspace.project().clone();
+                    ContextStore::new(project, prompt_builder.clone(), cx)
                 })?
                 .await?;
+
             workspace.update(&mut cx, |workspace, cx| {
                 // TODO: deserialize state.
                 cx.new_view(|cx| Self::new(workspace, context_store, cx))
@@ -290,6 +340,14 @@ impl AssistantPanel {
         cx: &mut ViewContext<Self>,
     ) -> Self {
         let model_selector_menu_handle = PopoverMenuHandle::default();
+        let model_summary_editor = cx.new_view(|cx| Editor::single_line(cx));
+        let context_editor_toolbar = cx.new_view(|_| {
+            ContextEditorToolbarItem::new(
+                workspace,
+                model_selector_menu_handle.clone(),
+                model_summary_editor.clone(),
+            )
+        });
         let pane = cx.new_view(|cx| {
             let mut pane = Pane::new(
                 workspace.weak_handle(),
@@ -304,8 +362,32 @@ impl AssistantPanel {
             pane.display_nav_history_buttons(None);
             pane.set_should_display_tab_bar(|_| true);
             pane.set_render_tab_bar_buttons(cx, move |pane, cx| {
-                h_flex()
+                let focus_handle = pane.focus_handle(cx);
+                let left_children = IconButton::new("history", IconName::TextSearch)
+                    .on_click(
+                        cx.listener(|_, _, cx| cx.dispatch_action(DeployHistory.boxed_clone())),
+                    )
+                    .tooltip(move |cx| {
+                        cx.new_view(|cx| {
+                            let keybind =
+                                KeyBinding::for_action_in(&DeployHistory, &focus_handle, cx);
+                            Tooltip::new("History").key_binding(keybind)
+                        })
+                        .into()
+                    })
+                    .selected(
+                        pane.active_item()
+                            .map_or(false, |item| item.downcast::<ContextHistory>().is_some()),
+                    );
+                let right_children = h_flex()
                     .gap(Spacing::Small.rems(cx))
+                    .child(
+                        IconButton::new("new-context", IconName::Plus)
+                            .on_click(
+                                cx.listener(|_, _, cx| cx.dispatch_action(NewFile.boxed_clone())),
+                            )
+                            .tooltip(|cx| Tooltip::for_action("New Context", &NewFile, cx)),
+                    )
                     .child(
                         IconButton::new("menu", IconName::Menu)
                             .icon_size(IconSize::Small)
@@ -320,6 +402,7 @@ impl AssistantPanel {
                                         .action("New Context", Box::new(NewFile))
                                         .action("History", Box::new(DeployHistory))
                                         .action("Prompt Library", Box::new(DeployPromptLibrary))
+                                        .action("Configure", Box::new(ShowConfiguration))
                                         .action(zoom_label, Box::new(ToggleZoom))
                                 });
                                 cx.subscribe(&menu, |pane, _, _: &DismissEvent, _| {
@@ -333,15 +416,12 @@ impl AssistantPanel {
                         el.child(Pane::render_menu_overlay(new_item_menu))
                     })
                     .into_any_element()
+                    .into();
+
+                (Some(left_children.into_any_element()), right_children)
             });
             pane.toolbar().update(cx, |toolbar, cx| {
-                toolbar.add_item(cx.new_view(|_| Breadcrumbs::new()), cx);
-                toolbar.add_item(
-                    cx.new_view(|_| {
-                        ContextEditorToolbarItem::new(workspace, model_selector_menu_handle.clone())
-                    }),
-                    cx,
-                );
+                toolbar.add_item(context_editor_toolbar.clone(), cx);
                 toolbar.add_item(cx.new_view(BufferSearchBar::new), cx)
             });
             pane
@@ -350,16 +430,29 @@ impl AssistantPanel {
         let subscriptions = vec![
             cx.observe(&pane, |_, _, cx| cx.notify()),
             cx.subscribe(&pane, Self::handle_pane_event),
-            cx.observe_global::<CompletionProvider>({
-                let mut prev_settings_version = CompletionProvider::global(cx).settings_version();
-                move |this, cx| {
-                    this.completion_provider_changed(prev_settings_version, cx);
-                    prev_settings_version = CompletionProvider::global(cx).settings_version();
-                }
-            }),
+            cx.subscribe(&context_editor_toolbar, Self::handle_toolbar_event),
+            cx.subscribe(&model_summary_editor, Self::handle_summary_editor_event),
+            cx.subscribe(&context_store, Self::handle_context_store_event),
+            cx.subscribe(
+                &LanguageModelRegistry::global(cx),
+                |this, _, event: &language_model::Event, cx| match event {
+                    language_model::Event::ActiveModelChanged => {
+                        this.completion_provider_changed(cx);
+                    }
+                    language_model::Event::ProviderStateChanged => {
+                        this.ensure_authenticated(cx);
+                    }
+                    language_model::Event::AddedProvider(_)
+                    | language_model::Event::RemovedProvider(_) => {
+                        this.ensure_authenticated(cx);
+                    }
+                },
+            ),
         ];
 
-        Self {
+        let watch_client_status = Self::watch_client_status(workspace.client().clone(), cx);
+
+        let mut this = Self {
             pane,
             workspace: workspace.weak_handle(),
             width: None,
@@ -369,9 +462,38 @@ impl AssistantPanel {
             languages: workspace.app_state().languages.clone(),
             fs: workspace.app_state().fs.clone(),
             subscriptions,
-            authentication_prompt: None,
             model_selector_menu_handle,
-        }
+            model_summary_editor,
+            authenticate_provider_task: None,
+            configuration_subscription: None,
+            client_status: None,
+            watch_client_status: Some(watch_client_status),
+            show_zed_ai_notice: false,
+        };
+        this.new_context(cx);
+        this
+    }
+
+    fn watch_client_status(client: Arc<Client>, cx: &mut ViewContext<Self>) -> Task<()> {
+        let mut status_rx = client.status();
+
+        cx.spawn(|this, mut cx| async move {
+            while let Some(status) = status_rx.next().await {
+                this.update(&mut cx, |this, cx| {
+                    if this.client_status.is_none()
+                        || this
+                            .client_status
+                            .map_or(false, |old_status| old_status != status)
+                    {
+                        this.update_zed_ai_notice_visibility(status, cx);
+                    }
+                    this.client_status = Some(status);
+                })
+                .log_err();
+            }
+            this.update(&mut cx, |this, _cx| this.watch_client_status = None)
+                .log_err();
+        })
     }
 
     fn handle_pane_event(
@@ -380,10 +502,19 @@ impl AssistantPanel {
         event: &pane::Event,
         cx: &mut ViewContext<Self>,
     ) {
-        match event {
-            pane::Event::Remove => cx.emit(PanelEvent::Close),
-            pane::Event::ZoomIn => cx.emit(PanelEvent::ZoomIn),
-            pane::Event::ZoomOut => cx.emit(PanelEvent::ZoomOut),
+        let update_model_summary = match event {
+            pane::Event::Remove => {
+                cx.emit(PanelEvent::Close);
+                false
+            }
+            pane::Event::ZoomIn => {
+                cx.emit(PanelEvent::ZoomIn);
+                false
+            }
+            pane::Event::ZoomOut => {
+                cx.emit(PanelEvent::ZoomOut);
+                false
+            }
 
             pane::Event::AddItem { item } => {
                 self.workspace
@@ -391,6 +522,7 @@ impl AssistantPanel {
                         item.added_to_pane(workspace, self.pane.clone(), cx)
                     })
                     .ok();
+                true
             }
 
             pane::Event::ActivateItem { local } => {
@@ -402,50 +534,184 @@ impl AssistantPanel {
                         .ok();
                 }
                 cx.emit(AssistantPanelEvent::ContextEdited);
+                true
             }
 
-            pane::Event::RemoveItem { .. } => {
+            pane::Event::RemoveItem { idx } => {
+                if self
+                    .pane
+                    .read(cx)
+                    .item_for_index(*idx)
+                    .map_or(false, |item| item.downcast::<ConfigurationView>().is_some())
+                {
+                    self.configuration_subscription = None;
+                }
+                false
+            }
+            pane::Event::RemovedItem { .. } => {
                 cx.emit(AssistantPanelEvent::ContextEdited);
+                true
             }
 
-            _ => {}
+            _ => false,
+        };
+
+        if update_model_summary {
+            if let Some(editor) = self.active_context_editor(cx) {
+                self.show_updated_summary(&editor, cx)
+            }
         }
     }
 
-    fn completion_provider_changed(
+    fn handle_summary_editor_event(
         &mut self,
-        prev_settings_version: usize,
+        model_summary_editor: View<Editor>,
+        event: &EditorEvent,
         cx: &mut ViewContext<Self>,
     ) {
-        if self.is_authenticated(cx) {
-            self.authentication_prompt = None;
+        if matches!(event, EditorEvent::Edited { .. }) {
+            if let Some(context_editor) = self.active_context_editor(cx) {
+                let new_summary = model_summary_editor.read(cx).text(cx);
+                context_editor.update(cx, |context_editor, cx| {
+                    context_editor.context.update(cx, |context, cx| {
+                        if context.summary().is_none()
+                            && (new_summary == DEFAULT_TAB_TITLE || new_summary.trim().is_empty())
+                        {
+                            return;
+                        }
+                        context.custom_summary(new_summary, cx)
+                    });
+                });
+            }
+        }
+    }
 
-            if let Some(editor) = self.active_context_editor(cx) {
-                editor.update(cx, |active_context, cx| {
-                    active_context
-                        .context
-                        .update(cx, |context, cx| context.completion_provider_changed(cx))
+    fn update_zed_ai_notice_visibility(
+        &mut self,
+        client_status: Status,
+        cx: &mut ViewContext<Self>,
+    ) {
+        let active_provider = LanguageModelRegistry::read_global(cx).active_provider();
+
+        // If we're signed out and don't have a provider configured, or we're signed-out AND Zed.dev is
+        // the provider, we want to show a nudge to sign in.
+        let show_zed_ai_notice = client_status.is_signed_out()
+            && active_provider.map_or(true, |provider| provider.id().0 == PROVIDER_ID);
+
+        self.show_zed_ai_notice = show_zed_ai_notice;
+        cx.notify();
+    }
+
+    fn handle_toolbar_event(
+        &mut self,
+        _: View<ContextEditorToolbarItem>,
+        _: &ContextEditorToolbarItemEvent,
+        cx: &mut ViewContext<Self>,
+    ) {
+        if let Some(context_editor) = self.active_context_editor(cx) {
+            context_editor.update(cx, |context_editor, cx| {
+                context_editor.context.update(cx, |context, cx| {
+                    context.summarize(true, cx);
                 })
-            }
+            })
+        }
+    }
 
-            if self.active_context_editor(cx).is_none() {
-                self.new_context(cx);
-            }
-            cx.notify();
-        } else if self.authentication_prompt.is_none()
-            || prev_settings_version != CompletionProvider::global(cx).settings_version()
+    fn handle_context_store_event(
+        &mut self,
+        _context_store: Model<ContextStore>,
+        event: &ContextStoreEvent,
+        cx: &mut ViewContext<Self>,
+    ) {
+        let ContextStoreEvent::ContextCreated(context_id) = event;
+        let Some(context) = self
+            .context_store
+            .read(cx)
+            .loaded_context_for_id(&context_id, cx)
+        else {
+            log::error!("no context found with ID: {}", context_id.to_proto());
+            return;
+        };
+        let lsp_adapter_delegate = make_lsp_adapter_delegate(&self.project, cx).log_err();
+
+        let assistant_panel = cx.view().downgrade();
+        let editor = cx.new_view(|cx| {
+            let mut editor = ContextEditor::for_context(
+                context,
+                self.fs.clone(),
+                self.workspace.clone(),
+                self.project.clone(),
+                lsp_adapter_delegate,
+                assistant_panel,
+                cx,
+            );
+            editor.insert_default_prompt(cx);
+            editor
+        });
+
+        self.show_context(editor.clone(), cx);
+    }
+
+    fn completion_provider_changed(&mut self, cx: &mut ViewContext<Self>) {
+        if let Some(editor) = self.active_context_editor(cx) {
+            editor.update(cx, |active_context, cx| {
+                active_context
+                    .context
+                    .update(cx, |context, cx| context.completion_provider_changed(cx))
+            })
+        }
+
+        let Some(new_provider_id) = LanguageModelRegistry::read_global(cx)
+            .active_provider()
+            .map(|p| p.id())
+        else {
+            return;
+        };
+
+        if self
+            .authenticate_provider_task
+            .as_ref()
+            .map_or(true, |(old_provider_id, _)| {
+                *old_provider_id != new_provider_id
+            })
         {
-            self.authentication_prompt =
-                Some(cx.update_global::<CompletionProvider, _>(|provider, cx| {
-                    provider.authentication_prompt(cx)
-                }));
-            cx.notify();
+            self.authenticate_provider_task = None;
+            self.ensure_authenticated(cx);
+        }
+
+        if let Some(status) = self.client_status {
+            self.update_zed_ai_notice_visibility(status, cx);
+        }
+    }
+
+    fn ensure_authenticated(&mut self, cx: &mut ViewContext<Self>) {
+        if self.is_authenticated(cx) {
+            return;
+        }
+
+        let Some(provider) = LanguageModelRegistry::read_global(cx).active_provider() else {
+            return;
+        };
+
+        let load_credentials = self.authenticate(cx);
+
+        if self.authenticate_provider_task.is_none() {
+            self.authenticate_provider_task = Some((
+                provider.id(),
+                cx.spawn(|this, mut cx| async move {
+                    let _ = load_credentials.await;
+                    this.update(&mut cx, |this, _cx| {
+                        this.authenticate_provider_task = None;
+                    })
+                    .log_err();
+                }),
+            ));
         }
     }
 
     pub fn inline_assist(
         workspace: &mut Workspace,
-        _: &InlineAssist,
+        action: &InlineAssist,
         cx: &mut ViewContext<Workspace>,
     ) {
         let settings = AssistantSettings::get_global(cx);
@@ -463,6 +729,7 @@ impl AssistantPanel {
             return;
         };
 
+        let initial_prompt = action.prompt.clone();
         if assistant_panel.update(cx, |assistant, cx| assistant.is_authenticated(cx)) {
             match inline_assist_target {
                 InlineAssistTarget::Editor(active_editor, include_context) => {
@@ -471,6 +738,7 @@ impl AssistantPanel {
                             &active_editor,
                             Some(cx.view().downgrade()),
                             include_context.then_some(&assistant_panel),
+                            initial_prompt,
                             cx,
                         )
                     })
@@ -481,6 +749,7 @@ impl AssistantPanel {
                             &active_terminal,
                             Some(cx.view().downgrade()),
                             Some(&assistant_panel),
+                            initial_prompt,
                             cx,
                         )
                     })
@@ -505,6 +774,7 @@ impl AssistantPanel {
                                     &active_editor,
                                     Some(workspace),
                                     assistant_panel.as_ref(),
+                                    initial_prompt,
                                     cx,
                                 )
                             })
@@ -515,6 +785,7 @@ impl AssistantPanel {
                                     &active_terminal,
                                     Some(workspace),
                                     assistant_panel.upgrade().as_ref(),
+                                    initial_prompt,
                                     cx,
                                 )
                             })
@@ -543,18 +814,11 @@ impl AssistantPanel {
                 .focus_handle(cx)
                 .contains_focused(cx)
             {
-                use feature_flags::FeatureFlagAppExt;
-                if !cx.has_flag::<feature_flags::TerminalInlineAssist>() {
-                    return None;
-                }
-
-                if let Some(terminal_view) = terminal_panel
-                    .read(cx)
-                    .pane()
-                    .read(cx)
-                    .active_item()
-                    .and_then(|t| t.downcast::<TerminalView>())
-                {
+                if let Some(terminal_view) = terminal_panel.read(cx).pane().and_then(|pane| {
+                    pane.read(cx)
+                        .active_item()
+                        .and_then(|t| t.downcast::<TerminalView>())
+                }) {
                     return Some(InlineAssistTarget::Terminal(terminal_view));
                 }
             }
@@ -579,33 +843,78 @@ impl AssistantPanel {
             .and_then(|item| item.act_as::<Editor>(cx))
         {
             Some(InlineAssistTarget::Editor(workspace_editor, true))
+        } else if let Some(terminal_view) = workspace
+            .active_item(cx)
+            .and_then(|item| item.act_as::<TerminalView>(cx))
+        {
+            Some(InlineAssistTarget::Terminal(terminal_view))
         } else {
             None
         }
     }
 
     fn new_context(&mut self, cx: &mut ViewContext<Self>) -> Option<View<ContextEditor>> {
-        let context = self.context_store.update(cx, |store, cx| store.create(cx));
-        let workspace = self.workspace.upgrade()?;
-        let lsp_adapter_delegate = workspace.update(cx, |workspace, cx| {
-            make_lsp_adapter_delegate(workspace.project(), cx).log_err()
-        });
+        if self.project.read(cx).is_remote() {
+            let task = self
+                .context_store
+                .update(cx, |store, cx| store.create_remote_context(cx));
 
-        let editor = cx.new_view(|cx| {
-            let mut editor = ContextEditor::for_context(
-                context,
-                self.fs.clone(),
-                workspace.clone(),
-                self.project.clone(),
-                lsp_adapter_delegate,
-                cx,
-            );
-            editor.insert_default_prompt(cx);
-            editor
-        });
+            cx.spawn(|this, mut cx| async move {
+                let context = task.await?;
 
-        self.show_context(editor.clone(), cx);
-        Some(editor)
+                this.update(&mut cx, |this, cx| {
+                    let workspace = this.workspace.clone();
+                    let project = this.project.clone();
+                    let lsp_adapter_delegate = make_lsp_adapter_delegate(&project, cx).log_err();
+
+                    let fs = this.fs.clone();
+                    let project = this.project.clone();
+                    let weak_assistant_panel = cx.view().downgrade();
+
+                    let editor = cx.new_view(|cx| {
+                        ContextEditor::for_context(
+                            context,
+                            fs,
+                            workspace,
+                            project,
+                            lsp_adapter_delegate,
+                            weak_assistant_panel,
+                            cx,
+                        )
+                    });
+
+                    this.show_context(editor, cx);
+
+                    anyhow::Ok(())
+                })??;
+
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+
+            None
+        } else {
+            let context = self.context_store.update(cx, |store, cx| store.create(cx));
+            let lsp_adapter_delegate = make_lsp_adapter_delegate(&self.project, cx).log_err();
+
+            let assistant_panel = cx.view().downgrade();
+            let editor = cx.new_view(|cx| {
+                let mut editor = ContextEditor::for_context(
+                    context,
+                    self.fs.clone(),
+                    self.workspace.clone(),
+                    self.project.clone(),
+                    lsp_adapter_delegate,
+                    assistant_panel,
+                    cx,
+                );
+                editor.insert_default_prompt(cx);
+                editor
+            });
+
+            self.show_context(editor.clone(), cx);
+            Some(editor)
+        }
     }
 
     fn show_context(&mut self, context_editor: View<ContextEditor>, cx: &mut ViewContext<Self>) {
@@ -620,20 +929,103 @@ impl AssistantPanel {
                 .push(cx.subscribe(&context_editor, Self::handle_context_editor_event));
         }
 
+        self.show_updated_summary(&context_editor, cx);
+
         cx.emit(AssistantPanelEvent::ContextEdited);
         cx.notify();
     }
 
+    fn show_updated_summary(
+        &self,
+        context_editor: &View<ContextEditor>,
+        cx: &mut ViewContext<Self>,
+    ) {
+        context_editor.update(cx, |context_editor, cx| {
+            let new_summary = context_editor
+                .context
+                .read(cx)
+                .summary()
+                .map(|s| s.text.clone())
+                .unwrap_or_else(|| context_editor.title(cx).to_string());
+            self.model_summary_editor.update(cx, |summary_editor, cx| {
+                if summary_editor.text(cx) != new_summary {
+                    summary_editor.set_text(new_summary, cx);
+                }
+            });
+        });
+    }
+
     fn handle_context_editor_event(
         &mut self,
-        _: View<ContextEditor>,
+        context_editor: View<ContextEditor>,
         event: &EditorEvent,
         cx: &mut ViewContext<Self>,
     ) {
         match event {
-            EditorEvent::TitleChanged { .. } => cx.notify(),
+            EditorEvent::TitleChanged => {
+                self.show_updated_summary(&context_editor, cx);
+                cx.notify()
+            }
             EditorEvent::Edited { .. } => cx.emit(AssistantPanelEvent::ContextEdited),
             _ => {}
+        }
+    }
+
+    fn show_configuration(
+        workspace: &mut Workspace,
+        _: &ShowConfiguration,
+        cx: &mut ViewContext<Workspace>,
+    ) {
+        let Some(panel) = workspace.panel::<AssistantPanel>(cx) else {
+            return;
+        };
+
+        if !panel.focus_handle(cx).contains_focused(cx) {
+            workspace.toggle_panel_focus::<AssistantPanel>(cx);
+        }
+
+        panel.update(cx, |this, cx| {
+            this.show_configuration_tab(cx);
+        })
+    }
+
+    fn show_configuration_tab(&mut self, cx: &mut ViewContext<Self>) {
+        let configuration_item_ix = self
+            .pane
+            .read(cx)
+            .items()
+            .position(|item| item.downcast::<ConfigurationView>().is_some());
+
+        if let Some(configuration_item_ix) = configuration_item_ix {
+            self.pane.update(cx, |pane, cx| {
+                pane.activate_item(configuration_item_ix, true, true, cx);
+            });
+        } else {
+            let configuration = cx.new_view(|cx| ConfigurationView::new(cx));
+            self.configuration_subscription = Some(cx.subscribe(
+                &configuration,
+                |this, _, event: &ConfigurationViewEvent, cx| match event {
+                    ConfigurationViewEvent::NewProviderContextEditor(provider) => {
+                        if LanguageModelRegistry::read_global(cx)
+                            .active_provider()
+                            .map_or(true, |p| p.id() != provider.id())
+                        {
+                            if let Some(model) = provider.provided_models(cx).first().cloned() {
+                                update_settings_file::<AssistantSettings>(
+                                    this.fs.clone(),
+                                    cx,
+                                    move |settings, _| settings.set_model(model),
+                                );
+                            }
+                        }
+
+                        this.new_context(cx);
+                    }
+                },
+            ));
+            self.pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(configuration), true, true, None, cx);
+            });
         }
     }
 
@@ -666,12 +1058,6 @@ impl AssistantPanel {
 
     fn deploy_prompt_library(&mut self, _: &DeployPromptLibrary, cx: &mut ViewContext<Self>) {
         open_prompt_library(self.languages.clone(), cx).detach_and_log_err(cx);
-    }
-
-    fn reset_credentials(&mut self, _: &ResetKey, cx: &mut ViewContext<Self>) {
-        CompletionProvider::global(cx)
-            .reset_credentials(cx)
-            .detach_and_log_err(cx);
     }
 
     fn toggle_model_selector(&mut self, _: &ToggleModelSelector, cx: &mut ViewContext<Self>) {
@@ -711,19 +1097,12 @@ impl AssistantPanel {
         let project = self.project.clone();
         let workspace = self.workspace.clone();
 
-        let lsp_adapter_delegate = workspace
-            .update(cx, |workspace, cx| {
-                make_lsp_adapter_delegate(workspace.project(), cx).log_err()
-            })
-            .log_err()
-            .flatten();
+        let lsp_adapter_delegate = make_lsp_adapter_delegate(&project, cx).log_err();
 
         cx.spawn(|this, mut cx| async move {
             let context = context.await?;
+            let assistant_panel = this.clone();
             this.update(&mut cx, |this, cx| {
-                let workspace = workspace
-                    .upgrade()
-                    .ok_or_else(|| anyhow!("workspace dropped"))?;
                 let editor = cx.new_view(|cx| {
                     ContextEditor::for_context(
                         context,
@@ -731,6 +1110,7 @@ impl AssistantPanel {
                         workspace,
                         project,
                         lsp_adapter_delegate,
+                        assistant_panel,
                         cx,
                     )
                 });
@@ -764,20 +1144,12 @@ impl AssistantPanel {
             .update(cx, |store, cx| store.open_remote_context(id, cx));
         let fs = self.fs.clone();
         let workspace = self.workspace.clone();
-
-        let lsp_adapter_delegate = workspace
-            .update(cx, |workspace, cx| {
-                make_lsp_adapter_delegate(workspace.project(), cx).log_err()
-            })
-            .log_err()
-            .flatten();
+        let lsp_adapter_delegate = make_lsp_adapter_delegate(&self.project, cx).log_err();
 
         cx.spawn(|this, mut cx| async move {
             let context = context.await?;
+            let assistant_panel = this.clone();
             this.update(&mut cx, |this, cx| {
-                let workspace = workspace
-                    .upgrade()
-                    .ok_or_else(|| anyhow!("workspace dropped"))?;
                 let editor = cx.new_view(|cx| {
                     ContextEditor::for_context(
                         context,
@@ -785,6 +1157,7 @@ impl AssistantPanel {
                         workspace,
                         this.project.clone(),
                         lsp_adapter_delegate,
+                        assistant_panel,
                         cx,
                     )
                 });
@@ -795,14 +1168,23 @@ impl AssistantPanel {
     }
 
     fn is_authenticated(&mut self, cx: &mut ViewContext<Self>) -> bool {
-        CompletionProvider::global(cx).is_authenticated()
+        LanguageModelRegistry::read_global(cx)
+            .active_provider()
+            .map_or(false, |provider| provider.is_authenticated(cx))
     }
 
     fn authenticate(&mut self, cx: &mut ViewContext<Self>) -> Task<Result<()>> {
-        cx.update_global::<CompletionProvider, _>(|provider, cx| provider.authenticate(cx))
+        LanguageModelRegistry::read_global(cx)
+            .active_provider()
+            .map_or(
+                Task::ready(Err(anyhow!("no active language model provider"))),
+                |provider| provider.authenticate(cx),
+            )
     }
+}
 
-    fn render_signed_in(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+impl Render for AssistantPanel {
+    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
         let mut registrar = DivRegistrar::new(
             |panel, cx| {
                 panel
@@ -823,21 +1205,14 @@ impl AssistantPanel {
             .on_action(cx.listener(|this, _: &workspace::NewFile, cx| {
                 this.new_context(cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &ShowConfiguration, cx| this.show_configuration_tab(cx)),
+            )
             .on_action(cx.listener(AssistantPanel::deploy_history))
             .on_action(cx.listener(AssistantPanel::deploy_prompt_library))
-            .on_action(cx.listener(AssistantPanel::reset_credentials))
             .on_action(cx.listener(AssistantPanel::toggle_model_selector))
             .child(registrar.size_full().child(self.pane.clone()))
-    }
-}
-
-impl Render for AssistantPanel {
-    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
-        if let Some(authentication_prompt) = self.authentication_prompt.as_ref() {
-            authentication_prompt.clone().into_any()
-        } else {
-            self.render_signed_in(cx).into_any_element()
-        }
+            .into_any_element()
     }
 }
 
@@ -859,14 +1234,18 @@ impl Panel for AssistantPanel {
     }
 
     fn set_position(&mut self, position: DockPosition, cx: &mut ViewContext<Self>) {
-        settings::update_settings_file::<AssistantSettings>(self.fs.clone(), cx, move |settings| {
-            let dock = match position {
-                DockPosition::Left => AssistantDockPosition::Left,
-                DockPosition::Bottom => AssistantDockPosition::Bottom,
-                DockPosition::Right => AssistantDockPosition::Right,
-            };
-            settings.set_dock(dock);
-        });
+        settings::update_settings_file::<AssistantSettings>(
+            self.fs.clone(),
+            cx,
+            move |settings, _| {
+                let dock = match position {
+                    DockPosition::Left => AssistantDockPosition::Left,
+                    DockPosition::Bottom => AssistantDockPosition::Bottom,
+                    DockPosition::Right => AssistantDockPosition::Right,
+                };
+                settings.set_dock(dock);
+            },
+        );
     }
 
     fn size(&self, cx: &WindowContext) -> Pixels {
@@ -897,16 +1276,11 @@ impl Panel for AssistantPanel {
 
     fn set_active(&mut self, active: bool, cx: &mut ViewContext<Self>) {
         if active {
-            let load_credentials = self.authenticate(cx);
-            cx.spawn(|this, mut cx| async move {
-                load_credentials.await?;
-                this.update(&mut cx, |this, cx| {
-                    if this.is_authenticated(cx) && this.active_context_editor(cx).is_none() {
-                        this.new_context(cx);
-                    }
-                })
-            })
-            .detach_and_log_err(cx);
+            if self.pane.read(cx).items_len() == 0 {
+                self.new_context(cx);
+            }
+
+            self.ensure_authenticated(cx);
         }
     }
 
@@ -956,34 +1330,52 @@ struct ScrollPosition {
     cursor: Anchor,
 }
 
+struct StepAssists {
+    assist_ids: Vec<InlineAssistId>,
+    editor: WeakView<Editor>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ActiveWorkflowStep {
+    range: Range<language::Anchor>,
+    suggestions: Option<ResolvedWorkflowStepEditSuggestions>,
+}
+
 pub struct ContextEditor {
     context: Model<Context>,
     fs: Arc<dyn Fs>,
     workspace: WeakView<Workspace>,
+    project: Model<Project>,
     lsp_adapter_delegate: Option<Arc<dyn LspAdapterDelegate>>,
     editor: View<Editor>,
-    blocks: HashSet<BlockId>,
+    blocks: HashSet<CustomBlockId>,
     scroll_position: Option<ScrollPosition>,
     remote_id: Option<workspace::ViewId>,
     pending_slash_command_creases: HashMap<Range<language::Anchor>, CreaseId>,
-    pending_slash_command_blocks: HashMap<Range<language::Anchor>, BlockId>,
+    pending_slash_command_blocks: HashMap<Range<language::Anchor>, CustomBlockId>,
     _subscriptions: Vec<Subscription>,
+    assists_by_step: HashMap<Range<language::Anchor>, StepAssists>,
+    active_workflow_step: Option<ActiveWorkflowStep>,
+    assistant_panel: WeakView<AssistantPanel>,
+    error_message: Option<SharedString>,
 }
 
-impl ContextEditor {
-    const MAX_TAB_TITLE_LEN: usize = 16;
+const DEFAULT_TAB_TITLE: &str = "New Context";
+const MAX_TAB_TITLE_LEN: usize = 16;
 
+impl ContextEditor {
     fn for_context(
         context: Model<Context>,
         fs: Arc<dyn Fs>,
-        workspace: View<Workspace>,
+        workspace: WeakView<Workspace>,
         project: Model<Project>,
         lsp_adapter_delegate: Option<Arc<dyn LspAdapterDelegate>>,
+        assistant_panel: WeakView<AssistantPanel>,
         cx: &mut ViewContext<Self>,
     ) -> Self {
         let completion_provider = SlashCommandCompletionProvider::new(
             Some(cx.view().downgrade()),
-            Some(workspace.downgrade()),
+            Some(workspace.clone()),
         );
 
         let editor = cx.new_view(|cx| {
@@ -996,7 +1388,7 @@ impl ContextEditor {
             editor.set_show_wrap_guides(false, cx);
             editor.set_show_indent_guides(false, cx);
             editor.set_completion_provider(Box::new(completion_provider));
-            editor.set_collaboration_hub(Box::new(project));
+            editor.set_collaboration_hub(Box::new(project.clone()));
             editor
         });
 
@@ -1016,10 +1408,15 @@ impl ContextEditor {
             scroll_position: None,
             remote_id: None,
             fs,
-            workspace: workspace.downgrade(),
+            workspace,
+            project,
             pending_slash_command_creases: HashMap::default(),
             pending_slash_command_blocks: HashMap::default(),
             _subscriptions,
+            assists_by_step: HashMap::default(),
+            active_workflow_step: None,
+            assistant_panel,
+            error_message: None,
         };
         this.update_message_headers(cx);
         this.insert_slash_command_output_sections(sections, cx);
@@ -1052,31 +1449,47 @@ impl ContextEditor {
     }
 
     fn assist(&mut self, _: &Assist, cx: &mut ViewContext<Self>) {
-        let cursors = self.cursors(cx);
+        if !self.apply_edit_step(cx) {
+            self.error_message = None;
+            self.send_to_model(cx);
+            cx.notify();
+        }
+    }
 
-        let user_messages = self.context.update(cx, |context, cx| {
-            let selected_messages = context
-                .messages_for_offsets(cursors, cx)
-                .into_iter()
-                .map(|message| message.id)
-                .collect();
-            context.assist(selected_messages, cx)
-        });
-        let new_selections = user_messages
-            .iter()
-            .map(|message| {
-                let cursor = message
+    fn apply_edit_step(&mut self, cx: &mut ViewContext<Self>) -> bool {
+        if let Some(step) = self.active_workflow_step.as_ref() {
+            if let Some(assists) = self.assists_by_step.get(&step.range) {
+                let assist_ids = assists.assist_ids.clone();
+                cx.window_context().defer(|cx| {
+                    InlineAssistant::update_global(cx, |assistant, cx| {
+                        for assist_id in assist_ids {
+                            assistant.start_assist(assist_id, cx);
+                        }
+                    })
+                });
+
+                !assists.assist_ids.is_empty()
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    fn send_to_model(&mut self, cx: &mut ViewContext<Self>) {
+        if let Some(user_message) = self.context.update(cx, |context, cx| context.assist(cx)) {
+            let new_selection = {
+                let cursor = user_message
                     .start
                     .to_offset(self.context.read(cx).buffer().read(cx));
                 cursor..cursor
-            })
-            .collect::<Vec<_>>();
-        if !new_selections.is_empty() {
+            };
             self.editor.update(cx, |editor, cx| {
                 editor.change_selections(
                     Some(Autoscroll::Strategy(AutoscrollStrategy::Fit)),
                     cx,
-                    |selections| selections.select_ranges(new_selections),
+                    |selections| selections.select_ranges([new_selection]),
                 );
             });
             // Avoid scrolling to the new cursor position so the assistant's output is stable.
@@ -1090,6 +1503,48 @@ impl ContextEditor {
             .update(cx, |context, _| context.cancel_last_assist())
         {
             cx.propagate();
+        }
+    }
+
+    fn debug_edit_steps(&mut self, _: &DebugEditSteps, cx: &mut ViewContext<Self>) {
+        let mut output = String::new();
+        for (i, step) in self.context.read(cx).workflow_steps().iter().enumerate() {
+            output.push_str(&format!("Step {}:\n", i + 1));
+            output.push_str(&format!(
+                "Content: {}\n",
+                self.context
+                    .read(cx)
+                    .buffer()
+                    .read(cx)
+                    .text_for_range(step.tagged_range.clone())
+                    .collect::<String>()
+            ));
+            match &step.edit_suggestions {
+                WorkflowStepEditSuggestions::Resolved(ResolvedWorkflowStepEditSuggestions {
+                    title,
+                    edit_suggestions,
+                }) => {
+                    output.push_str("Resolution:\n");
+                    output.push_str(&format!("  {:?}\n", title));
+                    output.push_str(&format!("  {:?}\n", edit_suggestions));
+                }
+                WorkflowStepEditSuggestions::Pending(_) => {
+                    output.push_str("Resolution: Pending\n");
+                }
+            }
+            output.push('\n');
+        }
+
+        let editor = self
+            .workspace
+            .update(cx, |workspace, cx| Editor::new_in_workspace(workspace, cx));
+
+        if let Ok(editor) = editor {
+            cx.spawn(|_, mut cx| async move {
+                let editor = editor.await?;
+                editor.update(&mut cx, |editor, cx| editor.set_text(output, cx))
+            })
+            .detach_and_notify_err(cx);
         }
     }
 
@@ -1192,18 +1647,16 @@ impl ContextEditor {
         cx: &mut ViewContext<Self>,
     ) {
         if let Some(command) = SlashCommandRegistry::global(cx).command(name) {
-            if let Some(lsp_adapter_delegate) = self.lsp_adapter_delegate.clone() {
-                let argument = argument.map(ToString::to_string);
-                let output = command.run(argument.as_deref(), workspace, lsp_adapter_delegate, cx);
-                self.context.update(cx, |context, cx| {
-                    context.insert_command_output(
-                        command_range,
-                        output,
-                        insert_trailing_newline,
-                        cx,
-                    )
-                });
-            }
+            let argument = argument.map(ToString::to_string);
+            let output = command.run(
+                argument.as_deref(),
+                workspace,
+                self.lsp_adapter_delegate.clone(),
+                cx,
+            );
+            self.context.update(cx, |context, cx| {
+                context.insert_command_output(command_range, output, insert_trailing_newline, cx)
+            });
         }
     }
 
@@ -1222,44 +1675,14 @@ impl ContextEditor {
                     context.save(Some(Duration::from_millis(500)), self.fs.clone(), cx);
                 });
             }
-            ContextEvent::EditSuggestionsChanged => {
-                self.editor.update(cx, |editor, cx| {
-                    let buffer = editor.buffer().read(cx).snapshot(cx);
-                    let excerpt_id = *buffer.as_singleton().unwrap().0;
-                    let context = self.context.read(cx);
-                    let highlighted_rows = context
-                        .edit_suggestions()
-                        .iter()
-                        .map(|suggestion| {
-                            let start = buffer
-                                .anchor_in_excerpt(excerpt_id, suggestion.source_range.start)
-                                .unwrap();
-                            let end = buffer
-                                .anchor_in_excerpt(excerpt_id, suggestion.source_range.end)
-                                .unwrap();
-                            start..=end
-                        })
-                        .collect::<Vec<_>>();
-
-                    editor.clear_row_highlights::<EditSuggestion>();
-                    for range in highlighted_rows {
-                        editor.highlight_rows::<EditSuggestion>(
-                            range,
-                            Some(
-                                cx.theme()
-                                    .colors()
-                                    .editor_document_highlight_read_background,
-                            ),
-                            false,
-                            cx,
-                        );
-                    }
-                });
+            ContextEvent::WorkflowStepsChanged => {
+                self.update_active_workflow_step(cx);
+                cx.notify();
             }
             ContextEvent::SummaryChanged => {
                 cx.emit(EditorEvent::TitleChanged);
                 self.context.update(cx, |context, cx| {
-                    context.save(None, self.fs.clone(), cx);
+                    context.save(Some(Duration::from_millis(500)), self.fs.clone(), cx);
                 });
             }
             ContextEvent::StreamedCompletion => {
@@ -1432,6 +1855,9 @@ impl ContextEditor {
                 }
             }
             ContextEvent::Operation(_) => {}
+            ContextEvent::AssistError(error_message) => {
+                self.error_message = Some(SharedString::from(error_message.clone()));
+            }
         }
     }
 
@@ -1515,10 +1941,222 @@ impl ContextEditor {
             }
             EditorEvent::SelectionsChanged { .. } => {
                 self.scroll_position = self.cursor_scroll_position(cx);
+                self.update_active_workflow_step(cx);
             }
             _ => {}
         }
         cx.emit(event.clone());
+    }
+
+    fn update_active_workflow_step(&mut self, cx: &mut ViewContext<Self>) {
+        let new_step = self
+            .workflow_step_range_for_cursor(cx)
+            .as_ref()
+            .and_then(|step_range| {
+                let workflow_step = self
+                    .context
+                    .read(cx)
+                    .workflow_step_for_range(step_range.clone())?;
+                Some(ActiveWorkflowStep {
+                    range: workflow_step.tagged_range.clone(),
+                    suggestions: workflow_step.edit_suggestions.as_resolved().cloned(),
+                })
+            });
+        if new_step.as_ref() != self.active_workflow_step.as_ref() {
+            if let Some(old_step) = self.active_workflow_step.take() {
+                self.cancel_workflow_step_if_idle(old_step.range, cx);
+            }
+
+            if let Some(new_step) = new_step {
+                self.activate_workflow_step(new_step, cx);
+            }
+        }
+    }
+
+    fn cancel_workflow_step_if_idle(
+        &mut self,
+        step_range: Range<language::Anchor>,
+        cx: &mut ViewContext<Self>,
+    ) {
+        let Some(step_assists) = self.assists_by_step.get_mut(&step_range) else {
+            return;
+        };
+        let Some(editor) = step_assists.editor.upgrade() else {
+            self.assists_by_step.remove(&step_range);
+            return;
+        };
+
+        InlineAssistant::update_global(cx, |assistant, cx| {
+            step_assists.assist_ids.retain(|assist_id| {
+                match assistant.status_for_assist(*assist_id, cx) {
+                    Some(CodegenStatus::Idle) | None => {
+                        assistant.finish_assist(*assist_id, true, cx);
+                        false
+                    }
+                    _ => true,
+                }
+            });
+        });
+
+        if step_assists.assist_ids.is_empty() {
+            self.assists_by_step.remove(&step_range);
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    if let Some(pane) = workspace.pane_for(&editor) {
+                        pane.update(cx, |pane, cx| {
+                            let item_id = editor.entity_id();
+                            if pane.is_active_preview_item(item_id) {
+                                pane.close_item_by_id(item_id, SaveIntent::Skip, cx)
+                                    .detach_and_log_err(cx);
+                            }
+                        });
+                    }
+                })
+                .ok();
+        }
+    }
+
+    fn activate_workflow_step(&mut self, step: ActiveWorkflowStep, cx: &mut ViewContext<Self>) {
+        if let Some(step_assists) = self.assists_by_step.get(&step.range) {
+            if let Some(editor) = step_assists.editor.upgrade() {
+                for assist_id in &step_assists.assist_ids {
+                    match InlineAssistant::global(cx).status_for_assist(*assist_id, cx) {
+                        Some(CodegenStatus::Idle) | None => {}
+                        _ => {
+                            self.workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace.activate_item(&editor, false, false, cx);
+                                })
+                                .ok();
+                            InlineAssistant::update_global(cx, |assistant, cx| {
+                                assistant.scroll_to_assist(*assist_id, cx)
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(ResolvedWorkflowStepEditSuggestions {
+            title,
+            edit_suggestions,
+        }) = step.suggestions.as_ref()
+        {
+            if let Some((editor, assist_ids)) =
+                self.suggest_edits(title.clone(), edit_suggestions.clone(), cx)
+            {
+                self.assists_by_step.insert(
+                    step.range.clone(),
+                    StepAssists {
+                        assist_ids,
+                        editor: editor.downgrade(),
+                    },
+                );
+            }
+        }
+
+        self.active_workflow_step = Some(step);
+    }
+
+    fn suggest_edits(
+        &mut self,
+        title: String,
+        edit_suggestions: HashMap<Model<Buffer>, Vec<EditSuggestionGroup>>,
+        cx: &mut ViewContext<Self>,
+    ) -> Option<(View<Editor>, Vec<InlineAssistId>)> {
+        let assistant_panel = self.assistant_panel.upgrade()?;
+        if edit_suggestions.is_empty() {
+            return None;
+        }
+
+        let editor;
+        let mut suggestion_groups = Vec::new();
+        if edit_suggestions.len() == 1 && edit_suggestions.values().next().unwrap().len() == 1 {
+            // If there's only one buffer and one suggestion group, open it directly
+            let (buffer, groups) = edit_suggestions.into_iter().next().unwrap();
+            let group = groups.into_iter().next().unwrap();
+            editor = self
+                .workspace
+                .update(cx, |workspace, cx| {
+                    let active_pane = workspace.active_pane().clone();
+                    workspace.open_project_item::<Editor>(active_pane, buffer, false, false, cx)
+                })
+                .log_err()?;
+
+            let (&excerpt_id, _, _) = editor
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .read(cx)
+                .as_singleton()
+                .unwrap();
+
+            // Scroll the editor to the suggested assist
+            editor.update(cx, |editor, cx| {
+                let multibuffer = editor.buffer().read(cx).snapshot(cx);
+                let (&excerpt_id, _, buffer) = multibuffer.as_singleton().unwrap();
+                let anchor = if group.context_range.start.to_offset(buffer) == 0 {
+                    Anchor::min()
+                } else {
+                    multibuffer
+                        .anchor_in_excerpt(excerpt_id, group.context_range.start)
+                        .unwrap()
+                };
+
+                editor.set_scroll_anchor(
+                    ScrollAnchor {
+                        offset: gpui::Point::default(),
+                        anchor,
+                    },
+                    cx,
+                );
+            });
+
+            suggestion_groups.push((excerpt_id, group));
+        } else {
+            // If there are multiple buffers or suggestion groups, create a multibuffer
+            let multibuffer = cx.new_model(|cx| {
+                let replica_id = self.project.read(cx).replica_id();
+                let mut multibuffer =
+                    MultiBuffer::new(replica_id, Capability::ReadWrite).with_title(title);
+                for (buffer, groups) in edit_suggestions {
+                    let excerpt_ids = multibuffer.push_excerpts(
+                        buffer,
+                        groups.iter().map(|suggestion_group| ExcerptRange {
+                            context: suggestion_group.context_range.clone(),
+                            primary: None,
+                        }),
+                        cx,
+                    );
+                    suggestion_groups.extend(excerpt_ids.into_iter().zip(groups));
+                }
+                multibuffer
+            });
+
+            editor = cx.new_view(|cx| {
+                Editor::for_multibuffer(multibuffer, Some(self.project.clone()), true, cx)
+            });
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(Box::new(editor.clone()), None, false, cx)
+                })
+                .log_err()?;
+        }
+
+        let mut assist_ids = Vec::new();
+        for (excerpt_id, suggestion_group) in suggestion_groups {
+            for suggestion in suggestion_group.suggestions {
+                assist_ids.extend(suggestion.show(
+                    &editor,
+                    excerpt_id,
+                    &self.workspace,
+                    &assistant_panel,
+                    cx,
+                ));
+            }
+        }
+        Some((editor, assist_ids))
     }
 
     fn handle_editor_search_event(
@@ -1615,7 +2253,10 @@ impl ContextEditor {
                                             div()
                                                 .id("error")
                                                 .tooltip(move |cx| Tooltip::text(error.clone(), cx))
-                                                .child(Icon::new(IconName::XCircle)),
+                                                .child(
+                                                    Icon::new(IconName::ExclamationTriangle)
+                                                        .color(Color::Error),
+                                                ),
                                         )
                                     } else {
                                         None
@@ -1785,199 +2426,194 @@ impl ContextEditor {
         });
     }
 
-    fn apply_edit(&mut self, _: &ApplyEdit, cx: &mut ViewContext<Self>) {
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        let project = workspace.read(cx).project().clone();
-
-        struct Edit {
-            old_text: String,
-            new_text: String,
-        }
-
-        let context = self.context.read(cx);
-        let context_buffer = context.buffer().read(cx);
-        let context_buffer_snapshot = context_buffer.snapshot();
-
-        let selections = self.editor.read(cx).selections.disjoint_anchors();
-        let mut selections = selections.iter().peekable();
-        let selected_suggestions = context
-            .edit_suggestions()
-            .iter()
-            .filter(|suggestion| {
-                while let Some(selection) = selections.peek() {
-                    if selection
-                        .end
-                        .text_anchor
-                        .cmp(&suggestion.source_range.start, context_buffer)
-                        .is_lt()
-                    {
-                        selections.next();
-                        continue;
-                    }
-                    if selection
-                        .start
-                        .text_anchor
-                        .cmp(&suggestion.source_range.end, context_buffer)
-                        .is_gt()
-                    {
-                        break;
-                    }
-                    return true;
-                }
-                false
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let mut opened_buffers: HashMap<PathBuf, Task<Result<Model<Buffer>>>> = HashMap::default();
-        project.update(cx, |project, cx| {
-            for suggestion in &selected_suggestions {
-                opened_buffers
-                    .entry(suggestion.full_path.clone())
-                    .or_insert_with(|| {
-                        project.open_buffer_for_full_path(&suggestion.full_path, cx)
-                    });
-            }
-        });
-
-        cx.spawn(|this, mut cx| async move {
-            let mut buffers_by_full_path = HashMap::default();
-            for (full_path, buffer) in opened_buffers {
-                if let Some(buffer) = buffer.await.log_err() {
-                    buffers_by_full_path.insert(full_path, buffer);
-                }
-            }
-
-            let mut suggestions_by_buffer = HashMap::default();
-            cx.update(|cx| {
-                for suggestion in selected_suggestions {
-                    if let Some(buffer) = buffers_by_full_path.get(&suggestion.full_path) {
-                        let (_, edits) = suggestions_by_buffer
-                            .entry(buffer.clone())
-                            .or_insert_with(|| (buffer.read(cx).snapshot(), Vec::new()));
-
-                        let mut lines = context_buffer_snapshot
-                            .as_rope()
-                            .chunks_in_range(
-                                suggestion.source_range.to_offset(&context_buffer_snapshot),
-                            )
-                            .lines();
-                        if let Some(suggestion) = parse_next_edit_suggestion(&mut lines) {
-                            let old_text = context_buffer_snapshot
-                                .text_for_range(suggestion.old_text_range)
-                                .collect();
-                            let new_text = context_buffer_snapshot
-                                .text_for_range(suggestion.new_text_range)
-                                .collect();
-                            edits.push(Edit { old_text, new_text });
-                        }
-                    }
-                }
-            })?;
-
-            let edits_by_buffer = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut result = HashMap::default();
-                    for (buffer, (snapshot, suggestions)) in suggestions_by_buffer {
-                        let edits =
-                            result
-                                .entry(buffer)
-                                .or_insert(Vec::<(Range<language::Anchor>, _)>::new());
-                        for suggestion in suggestions {
-                            if let Some(range) =
-                                fuzzy_search_lines(snapshot.as_rope(), &suggestion.old_text)
-                            {
-                                let edit_start = snapshot.anchor_after(range.start);
-                                let edit_end = snapshot.anchor_before(range.end);
-                                if let Err(ix) = edits.binary_search_by(|(range, _)| {
-                                    range.start.cmp(&edit_start, &snapshot)
-                                }) {
-                                    edits.insert(
-                                        ix,
-                                        (edit_start..edit_end, suggestion.new_text.clone()),
-                                    );
-                                }
-                            } else {
-                                log::info!(
-                                    "assistant edit did not match any text in buffer {:?}",
-                                    &suggestion.old_text
-                                );
-                            }
-                        }
-                    }
-                    result
-                })
-                .await;
-
-            let mut project_transaction = ProjectTransaction::default();
-            let (editor, workspace, title) = this.update(&mut cx, |this, cx| {
-                for (buffer_handle, edits) in edits_by_buffer {
-                    buffer_handle.update(cx, |buffer, cx| {
-                        buffer.start_transaction();
-                        buffer.edit(
-                            edits,
-                            Some(AutoindentMode::Block {
-                                original_indent_columns: Vec::new(),
-                            }),
-                            cx,
-                        );
-                        buffer.end_transaction(cx);
-                        if let Some(transaction) = buffer.finalize_last_transaction() {
-                            project_transaction
-                                .0
-                                .insert(buffer_handle.clone(), transaction.clone());
-                        }
-                    });
-                }
-
-                (
-                    this.editor.downgrade(),
-                    this.workspace.clone(),
-                    this.title(cx),
-                )
-            })?;
-
-            Editor::open_project_transaction(
-                &editor,
-                workspace,
-                project_transaction,
-                format!("Edits from {}", title),
-                cx,
-            )
-            .await
-        })
-        .detach_and_log_err(cx);
-    }
-
     fn save(&mut self, _: &Save, cx: &mut ViewContext<Self>) {
-        self.context
-            .update(cx, |context, cx| context.save(None, self.fs.clone(), cx));
+        self.context.update(cx, |context, cx| {
+            context.save(Some(Duration::from_millis(500)), self.fs.clone(), cx)
+        });
     }
 
-    fn title(&self, cx: &AppContext) -> String {
+    fn title(&self, cx: &AppContext) -> Cow<str> {
         self.context
             .read(cx)
             .summary()
             .map(|summary| summary.text.clone())
-            .unwrap_or_else(|| "New Context".into())
+            .map(Cow::Owned)
+            .unwrap_or_else(|| Cow::Borrowed(DEFAULT_TAB_TITLE))
+    }
+
+    fn dismiss_error_message(&mut self, cx: &mut ViewContext<Self>) {
+        self.error_message = None;
+        cx.notify();
+    }
+
+    fn render_notice(&self, cx: &mut ViewContext<Self>) -> Option<AnyElement> {
+        use feature_flags::FeatureFlagAppExt;
+        let nudge = self.assistant_panel.upgrade().map(|assistant_panel| {
+            assistant_panel.read(cx).show_zed_ai_notice && cx.has_flag::<feature_flags::ZedPro>()
+        });
+
+        if let Some(error) = self.error_message.clone() {
+            Some(Self::render_error_popover(error, cx).into_any_element())
+        } else if nudge.unwrap_or(false) {
+            Some(
+                v_flex()
+                    .elevation_3(cx)
+                    .p_2()
+                    .gap_2()
+                    .child(
+                        Label::new("Use Zed AI")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(h_flex().justify_end().child(
+                        Button::new("sign-in", "Sign in to use Zed AI").on_click(cx.listener(
+                            |this, _event, cx| {
+                                let client = this
+                                    .workspace
+                                    .update(cx, |workspace, _| workspace.client().clone())
+                                    .log_err();
+
+                                if let Some(client) = client {
+                                    cx.spawn(|this, mut cx| async move {
+                                        client.authenticate_and_connect(true, &mut cx).await?;
+                                        this.update(&mut cx, |_, cx| cx.notify())
+                                    })
+                                    .detach_and_log_err(cx)
+                                }
+                            },
+                        )),
+                    ))
+                    .into_any_element(),
+            )
+        } else if let Some(configuration_error) = configuration_error(cx) {
+            let label = match configuration_error {
+                ConfigurationError::NoProvider => "No provider configured",
+                ConfigurationError::ProviderNotAuthenticated => "Provider is not configured",
+            };
+            Some(
+                v_flex()
+                    .elevation_3(cx)
+                    .p_2()
+                    .gap_2()
+                    .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                    .child(
+                        h_flex().justify_end().child(
+                            Button::new("open-configuration", "Open configuration")
+                                .icon(IconName::Settings)
+                                .icon_size(IconSize::Small)
+                                .on_click({
+                                    let focus_handle = self.focus_handle(cx).clone();
+                                    move |_event, cx| {
+                                        focus_handle.dispatch_action(&ShowConfiguration, cx);
+                                    }
+                                }),
+                        ),
+                    )
+                    .into_any_element(),
+            )
+        } else {
+            None
+        }
+    }
+
+    fn render_error_popover(error: SharedString, cx: &mut ViewContext<Self>) -> Div {
+        v_flex()
+            .p_2()
+            .elevation_2(cx)
+            .bg(cx.theme().colors().surface_background)
+            .min_w_24()
+            .occlude()
+            .child(
+                Label::new("Error interacting with language model")
+                    .size(LabelSize::Small)
+                    .weight(FontWeight::BOLD)
+                    .color(Color::Muted),
+            )
+            .child(Label::new(error).size(LabelSize::Small))
+            .child(
+                h_flex().justify_end().child(
+                    Button::new("dismiss", "Dismiss")
+                        .on_click(cx.listener(|this, _, cx| this.dismiss_error_message(cx))),
+                ),
+            )
     }
 
     fn render_send_button(&self, cx: &mut ViewContext<Self>) -> impl IntoElement {
         let focus_handle = self.focus_handle(cx).clone();
+        let button_text = match self.active_workflow_step.as_ref() {
+            Some(step) => {
+                if step.suggestions.is_none() {
+                    "Computing Changes..."
+                } else {
+                    "Apply Changes"
+                }
+            }
+            None => "Send",
+        };
+
+        let (style, tooltip) = match token_state(&self.context, cx) {
+            Some(TokenState::NoTokensLeft { .. }) => (
+                ButtonStyle::Tinted(TintColor::Negative),
+                Some(Tooltip::text("Token limit reached", cx)),
+            ),
+            Some(TokenState::HasMoreTokens {
+                over_warn_threshold,
+                ..
+            }) => {
+                let (style, tooltip) = if over_warn_threshold {
+                    (
+                        ButtonStyle::Tinted(TintColor::Warning),
+                        Some(Tooltip::text("Token limit is close to exhaustion", cx)),
+                    )
+                } else {
+                    (ButtonStyle::Filled, None)
+                };
+                (style, tooltip)
+            }
+            None => (ButtonStyle::Filled, None),
+        };
+
         ButtonLike::new("send_button")
-            .style(ButtonStyle::Filled)
+            .style(style)
+            .when_some(tooltip, |button, tooltip| {
+                button.tooltip(move |_| tooltip.clone())
+            })
             .layer(ElevationIndex::ModalSurface)
             .children(
                 KeyBinding::for_action_in(&Assist, &focus_handle, cx)
                     .map(|binding| binding.into_any_element()),
             )
-            .child(Label::new("Send"))
+            .child(Label::new(button_text))
             .on_click(move |_event, cx| {
                 focus_handle.dispatch_action(&Assist, cx);
             })
+    }
+
+    fn workflow_step_range_for_cursor(&self, cx: &AppContext) -> Option<Range<language::Anchor>> {
+        let newest_cursor = self
+            .editor
+            .read(cx)
+            .selections
+            .newest_anchor()
+            .head()
+            .text_anchor;
+        let context = self.context.read(cx);
+        let buffer = context.buffer().read(cx);
+
+        let edit_steps = context.workflow_steps();
+        edit_steps
+            .binary_search_by(|step| {
+                let step_range = step.tagged_range.clone();
+                if newest_cursor.cmp(&step_range.start, buffer).is_lt() {
+                    Ordering::Greater
+                } else if newest_cursor.cmp(&step_range.end, buffer).is_gt() {
+                    Ordering::Less
+                } else {
+                    Ordering::Equal
+                }
+            })
+            .ok()
+            .map(|index| edit_steps[index].tagged_range.clone())
     }
 }
 
@@ -1995,20 +2631,37 @@ impl Render for ContextEditor {
             .capture_action(cx.listener(ContextEditor::confirm_command))
             .on_action(cx.listener(ContextEditor::assist))
             .on_action(cx.listener(ContextEditor::split))
-            .on_action(cx.listener(ContextEditor::apply_edit))
+            .on_action(cx.listener(ContextEditor::debug_edit_steps))
             .size_full()
             .v_flex()
             .child(
                 div()
                     .flex_grow()
                     .bg(cx.theme().colors().editor_background)
-                    .child(self.editor.clone())
+                    .child(self.editor.clone()),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .relative()
+                    .when_some(self.render_notice(cx), |this, notice| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .w_3_4()
+                                .min_w_24()
+                                .max_w_128()
+                                .right_4()
+                                .bottom_9()
+                                .child(notice),
+                        )
+                    })
                     .child(
                         h_flex()
                             .w_full()
                             .absolute()
-                            .bottom_0()
-                            .p_4()
+                            .right_4()
+                            .bottom_2()
                             .justify_end()
                             .child(self.render_send_button(cx)),
                     ),
@@ -2026,14 +2679,13 @@ impl Item for ContextEditor {
     type Event = editor::EditorEvent;
 
     fn tab_content_text(&self, cx: &WindowContext) -> Option<SharedString> {
-        Some(util::truncate_and_trailoff(&self.title(cx), Self::MAX_TAB_TITLE_LEN).into())
+        Some(util::truncate_and_trailoff(&self.title(cx), MAX_TAB_TITLE_LEN).into())
     }
 
     fn to_item_events(event: &Self::Event, mut f: impl FnMut(item::ItemEvent)) {
         match event {
             EditorEvent::Edited { .. } => {
                 f(item::ItemEvent::Edit);
-                f(item::ItemEvent::UpdateBreadcrumbs);
             }
             EditorEvent::TitleChanged => {
                 f(item::ItemEvent::UpdateTab);
@@ -2043,46 +2695,11 @@ impl Item for ContextEditor {
     }
 
     fn tab_tooltip_text(&self, cx: &AppContext) -> Option<SharedString> {
-        Some(self.title(cx).into())
+        Some(self.title(cx).to_string().into())
     }
 
     fn as_searchable(&self, handle: &View<Self>) -> Option<Box<dyn SearchableItemHandle>> {
         Some(Box::new(handle.clone()))
-    }
-
-    fn breadcrumbs(
-        &self,
-        theme: &theme::Theme,
-        cx: &AppContext,
-    ) -> Option<Vec<item::BreadcrumbText>> {
-        let editor = self.editor.read(cx);
-        let cursor = editor.selections.newest_anchor().head();
-        let multibuffer = &editor.buffer().read(cx);
-        let (_, symbols) = multibuffer.symbols_containing(cursor, Some(&theme.syntax()), cx)?;
-
-        let settings = ThemeSettings::get_global(cx);
-
-        let mut breadcrumbs = Vec::new();
-
-        let title = self.title(cx);
-        if title.chars().count() > Self::MAX_TAB_TITLE_LEN {
-            breadcrumbs.push(BreadcrumbText {
-                text: title,
-                highlights: None,
-                font: Some(settings.buffer_font.clone()),
-            });
-        }
-
-        breadcrumbs.extend(symbols.into_iter().map(|symbol| BreadcrumbText {
-            text: symbol.text,
-            highlights: Some(symbol.highlight_ranges),
-            font: Some(settings.buffer_font.clone()),
-        }));
-        Some(breadcrumbs)
-    }
-
-    fn breadcrumb_location(&self) -> ToolbarItemLocation {
-        ToolbarItemLocation::PrimaryLeft
     }
 
     fn set_nav_history(&mut self, nav_history: pane::ItemNavHistory, cx: &mut ViewContext<Self>) {
@@ -2291,19 +2908,20 @@ pub struct ContextEditorToolbarItem {
     fs: Arc<dyn Fs>,
     workspace: WeakView<Workspace>,
     active_context_editor: Option<WeakView<ContextEditor>>,
-    model_selector_menu_handle: PopoverMenuHandle<ContextMenu>,
+    model_summary_editor: View<Editor>,
 }
 
 impl ContextEditorToolbarItem {
     pub fn new(
         workspace: &Workspace,
-        model_selector_menu_handle: PopoverMenuHandle<ContextMenu>,
+        _model_selector_menu_handle: PopoverMenuHandle<ContextMenu>,
+        model_summary_editor: View<Editor>,
     ) -> Self {
         Self {
             fs: workspace.app_state().fs.clone(),
             workspace: workspace.weak_handle(),
             active_context_editor: None,
-            model_selector_menu_handle,
+            model_summary_editor,
         }
     }
 
@@ -2372,25 +2990,30 @@ impl ContextEditorToolbarItem {
     }
 
     fn render_remaining_tokens(&self, cx: &mut ViewContext<Self>) -> Option<impl IntoElement> {
-        let model = CompletionProvider::global(cx).model();
         let context = &self
             .active_context_editor
             .as_ref()?
             .upgrade()?
             .read(cx)
             .context;
-        let token_count = context.read(cx).token_count()?;
-        let max_token_count = model.max_token_count();
-
-        let remaining_tokens = max_token_count as isize - token_count as isize;
-        let token_count_color = if remaining_tokens <= 0 {
-            Color::Error
-        } else if token_count as f32 / max_token_count as f32 >= 0.8 {
-            Color::Warning
-        } else {
-            Color::Muted
+        let (token_count_color, token_count, max_token_count) = match token_state(context, cx)? {
+            TokenState::NoTokensLeft {
+                max_token_count,
+                token_count,
+            } => (Color::Error, token_count, max_token_count),
+            TokenState::HasMoreTokens {
+                max_token_count,
+                token_count,
+                over_warn_threshold,
+            } => {
+                let color = if over_warn_threshold {
+                    Color::Warning
+                } else {
+                    Color::Muted
+                };
+                (color, token_count, max_token_count)
+            }
         };
-
         Some(
             h_flex()
                 .gap_0p5()
@@ -2411,14 +3034,78 @@ impl ContextEditorToolbarItem {
 
 impl Render for ContextEditorToolbarItem {
     fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
-        h_flex()
+        let left_side = h_flex()
+            .gap_2()
+            .flex_1()
+            .min_w(rems(DEFAULT_TAB_TITLE.len() as f32))
+            .when(self.active_context_editor.is_some(), |left_side| {
+                left_side
+                    .child(
+                        IconButton::new("regenerate-context", IconName::ArrowCircle)
+                            .tooltip(|cx| Tooltip::text("Regenerate Summary", cx))
+                            .on_click(cx.listener(move |_, _, cx| {
+                                cx.emit(ContextEditorToolbarItemEvent::RegenerateSummary)
+                            })),
+                    )
+                    .child(self.model_summary_editor.clone())
+            });
+
+        let active_provider = LanguageModelRegistry::read_global(cx).active_provider();
+        let active_model = LanguageModelRegistry::read_global(cx).active_model();
+
+        let right_side = h_flex()
             .gap_2()
             .child(ModelSelector::new(
-                self.model_selector_menu_handle.clone(),
                 self.fs.clone(),
+                ButtonLike::new("active-model")
+                    .style(ButtonStyle::Subtle)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .overflow_x_hidden()
+                                    .flex_grow()
+                                    .whitespace_nowrap()
+                                    .child(match (active_provider, active_model) {
+                                        (Some(provider), Some(model)) => h_flex()
+                                            .gap_1()
+                                            .child(
+                                                Icon::new(provider.icon())
+                                                    .color(Color::Muted)
+                                                    .size(IconSize::XSmall),
+                                            )
+                                            .child(
+                                                Label::new(model.name().0)
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            )
+                                            .into_any_element(),
+                                        _ => Label::new("No model selected")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .into_any_element(),
+                                    }),
+                            )
+                            .child(
+                                Icon::new(IconName::ChevronDown)
+                                    .color(Color::Muted)
+                                    .size(IconSize::XSmall),
+                            ),
+                    )
+                    .tooltip(move |cx| {
+                        Tooltip::for_action("Change Model", &ToggleModelSelector, cx)
+                    }),
             ))
             .children(self.render_remaining_tokens(cx))
-            .child(self.render_inject_context_menu(cx))
+            .child(self.render_inject_context_menu(cx));
+
+        h_flex()
+            .size_full()
+            .justify_between()
+            .child(left_side)
+            .child(right_side)
     }
 }
 
@@ -2445,6 +3132,11 @@ impl ToolbarItemView for ContextEditorToolbarItem {
 }
 
 impl EventEmitter<ToolbarItemEvent> for ContextEditorToolbarItem {}
+
+enum ContextEditorToolbarItemEvent {
+    RegenerateSummary,
+}
+impl EventEmitter<ContextEditorToolbarItemEvent> for ContextEditorToolbarItem {}
 
 pub struct ContextHistory {
     picker: View<Picker<SavedContextPickerDelegate>>,
@@ -2525,6 +3217,170 @@ impl Item for ContextHistory {
 
     fn tab_content_text(&self, _cx: &WindowContext) -> Option<SharedString> {
         Some("History".into())
+    }
+}
+
+pub struct ConfigurationView {
+    focus_handle: FocusHandle,
+    configuration_views: HashMap<LanguageModelProviderId, AnyView>,
+    _registry_subscription: Subscription,
+}
+
+impl ConfigurationView {
+    fn new(cx: &mut ViewContext<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+
+        let registry_subscription = cx.subscribe(
+            &LanguageModelRegistry::global(cx),
+            |this, _, event: &language_model::Event, cx| match event {
+                language_model::Event::AddedProvider(provider_id) => {
+                    let provider = LanguageModelRegistry::read_global(cx).provider(provider_id);
+                    if let Some(provider) = provider {
+                        this.add_configuration_view(&provider, cx);
+                    }
+                }
+                language_model::Event::RemovedProvider(provider_id) => {
+                    this.remove_configuration_view(provider_id);
+                }
+                _ => {}
+            },
+        );
+
+        let mut this = Self {
+            focus_handle,
+            configuration_views: HashMap::default(),
+            _registry_subscription: registry_subscription,
+        };
+        this.build_configuration_views(cx);
+        this
+    }
+
+    fn build_configuration_views(&mut self, cx: &mut ViewContext<Self>) {
+        let providers = LanguageModelRegistry::read_global(cx).providers();
+        for provider in providers {
+            self.add_configuration_view(&provider, cx);
+        }
+    }
+
+    fn remove_configuration_view(&mut self, provider_id: &LanguageModelProviderId) {
+        self.configuration_views.remove(provider_id);
+    }
+
+    fn add_configuration_view(
+        &mut self,
+        provider: &Arc<dyn LanguageModelProvider>,
+        cx: &mut ViewContext<Self>,
+    ) {
+        let configuration_view = provider.configuration_view(cx);
+        self.configuration_views
+            .insert(provider.id(), configuration_view);
+    }
+
+    fn render_provider_view(
+        &mut self,
+        provider: &Arc<dyn LanguageModelProvider>,
+        cx: &mut ViewContext<Self>,
+    ) -> Div {
+        let provider_name = provider.name().0.clone();
+        let configuration_view = self.configuration_views.get(&provider.id()).cloned();
+
+        v_flex()
+            .gap_4()
+            .child(Headline::new(provider_name.clone()).size(HeadlineSize::Medium))
+            .child(
+                div()
+                    .p(Spacing::Large.rems(cx))
+                    .bg(cx.theme().colors().title_bar_background)
+                    .border_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .rounded_md()
+                    .when(configuration_view.is_none(), |this| {
+                        this.child(div().child(Label::new(format!(
+                            "No configuration view for {}",
+                            provider_name
+                        ))))
+                    })
+                    .when_some(configuration_view, |this, configuration_view| {
+                        this.child(configuration_view)
+                    }),
+            )
+            .when(provider.is_authenticated(cx), move |this| {
+                this.child(
+                    h_flex().justify_end().child(
+                        Button::new(
+                            "new-context",
+                            format!("Open new context using {}", provider_name),
+                        )
+                        .icon_position(IconPosition::Start)
+                        .icon(IconName::Plus)
+                        .style(ButtonStyle::Filled)
+                        .layer(ElevationIndex::ModalSurface)
+                        .on_click(cx.listener({
+                            let provider = provider.clone();
+                            move |_, _, cx| {
+                                cx.emit(ConfigurationViewEvent::NewProviderContextEditor(
+                                    provider.clone(),
+                                ))
+                            }
+                        })),
+                    ),
+                )
+            })
+    }
+}
+
+impl Render for ConfigurationView {
+    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+        let providers = LanguageModelRegistry::read_global(cx).providers();
+        let provider_views = providers
+            .into_iter()
+            .map(|provider| self.render_provider_view(&provider, cx))
+            .collect::<Vec<_>>();
+
+        v_flex()
+            .id("assistant-configuration-view")
+            .track_focus(&self.focus_handle)
+            .w_full()
+            .min_h_full()
+            .p(Spacing::XXLarge.rems(cx))
+            .overflow_y_scroll()
+            .gap_6()
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(Headline::new("Configure your Assistant").size(HeadlineSize::Medium)),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        Label::new(
+                            "At least one provider must be configured to use the assistant.",
+                        )
+                        .color(Color::Muted),
+                    )
+                    .child(v_flex().mt_2().gap_4().children(provider_views)),
+            )
+    }
+}
+
+pub enum ConfigurationViewEvent {
+    NewProviderContextEditor(Arc<dyn LanguageModelProvider>),
+}
+
+impl EventEmitter<ConfigurationViewEvent> for ConfigurationView {}
+
+impl FocusableView for ConfigurationView {
+    fn focus_handle(&self, _: &AppContext) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Item for ConfigurationView {
+    type Event = ConfigurationViewEvent;
+
+    fn tab_content_text(&self, _cx: &WindowContext) -> Option<SharedString> {
+        Some("Configuration".into())
     }
 }
 
@@ -2639,7 +3495,7 @@ fn make_lsp_adapter_delegate(
     project.update(cx, |project, cx| {
         // TODO: Find the right worktree.
         let worktree = project
-            .worktrees()
+            .worktrees(cx)
             .next()
             .ok_or_else(|| anyhow!("no worktrees when constructing ProjectLspAdapterDelegate"))?;
         Ok(ProjectLspAdapterDelegate::new(project, &worktree, cx) as Arc<dyn LspAdapterDelegate>)
@@ -2657,4 +3513,67 @@ fn slash_command_error_block_renderer(message: String) -> RenderBlock {
             )
             .into_any()
     })
+}
+
+enum TokenState {
+    NoTokensLeft {
+        max_token_count: usize,
+        token_count: usize,
+    },
+    HasMoreTokens {
+        max_token_count: usize,
+        token_count: usize,
+        over_warn_threshold: bool,
+    },
+}
+
+fn token_state(context: &Model<Context>, cx: &AppContext) -> Option<TokenState> {
+    const WARNING_TOKEN_THRESHOLD: f32 = 0.8;
+
+    let model = LanguageModelRegistry::read_global(cx).active_model()?;
+    let token_count = context.read(cx).token_count()?;
+    let max_token_count = model.max_token_count();
+
+    let remaining_tokens = max_token_count as isize - token_count as isize;
+    let token_state = if remaining_tokens <= 0 {
+        TokenState::NoTokensLeft {
+            max_token_count,
+            token_count,
+        }
+    } else {
+        let over_warn_threshold =
+            token_count as f32 / max_token_count as f32 >= WARNING_TOKEN_THRESHOLD;
+        TokenState::HasMoreTokens {
+            max_token_count,
+            token_count,
+            over_warn_threshold,
+        }
+    };
+    Some(token_state)
+}
+
+enum ConfigurationError {
+    NoProvider,
+    ProviderNotAuthenticated,
+}
+
+fn configuration_error(cx: &AppContext) -> Option<ConfigurationError> {
+    let provider = LanguageModelRegistry::read_global(cx).active_provider();
+    let is_authenticated = provider
+        .as_ref()
+        .map_or(false, |provider| provider.is_authenticated(cx));
+
+    if provider.is_some() && is_authenticated {
+        return None;
+    }
+
+    if provider.is_none() {
+        return Some(ConfigurationError::NoProvider);
+    }
+
+    if !is_authenticated {
+        return Some(ConfigurationError::ProviderNotAuthenticated);
+    }
+
+    None
 }
