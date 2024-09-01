@@ -6,9 +6,10 @@ use ollama::{
     get_models, preload_model, stream_chat_completion, ChatMessage, ChatOptions, ChatRequest,
     ChatResponseDelta, OllamaToolCall,
 };
-use serde_json::Value;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore};
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use ui::{prelude::*, ButtonLike, Indicator};
 use util::ResultExt;
 
@@ -29,6 +30,17 @@ const PROVIDER_NAME: &str = "Ollama";
 pub struct OllamaSettings {
     pub api_url: String,
     pub low_speed_timeout: Option<Duration>,
+    pub available_models: Vec<AvailableModel>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AvailableModel {
+    /// The model name in the Ollama API (e.g. "llama3.1:latest")
+    pub name: String,
+    /// The model's name in Zed's UI, such as in the model selector dropdown menu in the assistant panel.
+    pub display_name: Option<String>,
+    /// The Context Length parameter to the model (aka num_ctx or n_ctx)
+    pub max_tokens: usize,
 }
 
 pub struct OllamaLanguageModelProvider {
@@ -62,7 +74,7 @@ impl State {
                 // indicating which models are embedding models,
                 // simply filter out models with "-embed" in their name
                 .filter(|model| !model.name.contains("-embed"))
-                .map(|model| ollama::Model::new(&model.name))
+                .map(|model| ollama::Model::new(&model.name, None, None))
                 .collect();
 
             models.sort_by(|a, b| a.name.cmp(&b.name));
@@ -124,10 +136,32 @@ impl LanguageModelProvider for OllamaLanguageModelProvider {
     }
 
     fn provided_models(&self, cx: &AppContext) -> Vec<Arc<dyn LanguageModel>> {
-        self.state
-            .read(cx)
+        let mut models: BTreeMap<String, ollama::Model> = BTreeMap::default();
+
+        // Add models from the Ollama API
+        for model in self.state.read(cx).available_models.iter() {
+            models.insert(model.name.clone(), model.clone());
+        }
+
+        // Override with available models from settings
+        for model in AllLanguageModelSettings::get_global(cx)
+            .ollama
             .available_models
             .iter()
+        {
+            models.insert(
+                model.name.clone(),
+                ollama::Model {
+                    name: model.name.clone(),
+                    display_name: model.display_name.clone(),
+                    max_tokens: model.max_tokens,
+                    keep_alive: None,
+                },
+            );
+        }
+
+        models
+            .into_values()
             .map(|model| {
                 Arc::new(OllamaLanguageModel {
                     id: LanguageModelId::from(model.name.clone()),
@@ -182,14 +216,14 @@ impl OllamaLanguageModel {
                 .into_iter()
                 .map(|msg| match msg.role {
                     Role::User => ChatMessage::User {
-                        content: msg.content,
+                        content: msg.string_contents(),
                     },
                     Role::Assistant => ChatMessage::Assistant {
-                        content: msg.content,
+                        content: msg.string_contents(),
                         tool_calls: None,
                     },
                     Role::System => ChatMessage::System {
-                        content: msg.content,
+                        content: msg.string_contents(),
                     },
                 })
                 .collect(),
@@ -257,7 +291,7 @@ impl LanguageModel for OllamaLanguageModel {
         let token_count = request
             .messages
             .iter()
-            .map(|msg| msg.content.chars().count())
+            .map(|msg| msg.string_contents().chars().count())
             .sum::<usize>()
             / 4;
 
@@ -311,7 +345,7 @@ impl LanguageModel for OllamaLanguageModel {
         tool_description: String,
         schema: serde_json::Value,
         cx: &AsyncAppContext,
-    ) -> BoxFuture<'static, Result<serde_json::Value>> {
+    ) -> BoxFuture<'static, Result<BoxStream<'static, Result<String>>>> {
         use ollama::{OllamaFunctionTool, OllamaTool};
         let function = OllamaFunctionTool {
             name: tool_name.clone(),
@@ -324,23 +358,19 @@ impl LanguageModel for OllamaLanguageModel {
         self.request_limiter
             .run(async move {
                 let response = response.await?;
-                let ChatMessage::Assistant {
-                    tool_calls,
-                    content,
-                } = response.message
-                else {
+                let ChatMessage::Assistant { tool_calls, .. } = response.message else {
                     bail!("message does not have an assistant role");
                 };
                 if let Some(tool_calls) = tool_calls.filter(|calls| !calls.is_empty()) {
                     for call in tool_calls {
                         let OllamaToolCall::Function(function) = call;
                         if function.name == tool_name {
-                            return Ok(function.arguments);
+                            return Ok(futures::stream::once(async move {
+                                Ok(function.arguments.to_string())
+                            })
+                            .boxed());
                         }
                     }
-                } else if let Ok(args) = serde_json::from_str::<Value>(&content) {
-                    // Parse content as arguments.
-                    return Ok(args);
                 } else {
                     bail!("assistant message does not have any tool calls");
                 };

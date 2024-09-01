@@ -3,6 +3,10 @@ ignore-files = true
 ignore-hidden = false
 extend-exclude = [
     ".git/",
+
+    # Contributor names aren't typos.
+    ".mailmap",
+
     # File suffixes aren't typos
     "assets/icons/file_icons/file_types.json",
     "crates/extensions_ui/src/extension_suggest.rs",
@@ -11,6 +15,9 @@ extend-exclude = [
     "crates/anthropic/src/supported_countries.rs",
     "crates/google_ai/src/supported_countries.rs",
     "crates/open_ai/src/supported_countries.rs",
+
+    # Some crate names are flagged as typos.
+    "crates/indexed_docs/src/providers/rustdoc/popular_crates.txt",
 
     # Stripe IDs are flagged as typos.
     "crates/collab/src/db/tests/processed_stripe_event_tests.rs",

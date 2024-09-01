@@ -276,11 +276,13 @@ impl TerminalInlineAssistant {
 
         messages.push(LanguageModelRequestMessage {
             role: Role::User,
-            content: prompt,
+            content: vec![prompt.into()],
+            cache: false,
         });
 
         Ok(LanguageModelRequest {
             messages,
+            tools: Vec::new(),
             stop: Vec::new(),
             temperature: 1.0,
         })
