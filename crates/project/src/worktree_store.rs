@@ -17,8 +17,8 @@ use gpui::{
 };
 use postage::oneshot;
 use rpc::{
-    proto::{self, AnyProtoClient, SSH_PROJECT_ID},
-    TypedEnvelope,
+    proto::{self, SSH_PROJECT_ID},
+    AnyProtoClient, TypedEnvelope,
 };
 use smol::{
     channel::{Receiver, Sender},
@@ -168,11 +168,10 @@ impl WorktreeStore {
         }
         let task = self.loading_worktrees.get(&path).unwrap().clone();
         cx.background_executor().spawn(async move {
-            let result = match task.await {
+            match task.await {
                 Ok(worktree) => Ok(worktree),
                 Err(err) => Err(anyhow!("{}", err)),
-            };
-            result
+            }
         })
     }
 
@@ -183,14 +182,23 @@ impl WorktreeStore {
         visible: bool,
         cx: &mut ModelContext<Self>,
     ) -> Task<Result<Model<Worktree>, Arc<anyhow::Error>>> {
-        let abs_path = abs_path.as_ref();
-        let root_name = abs_path.file_name().unwrap().to_string_lossy().to_string();
-        let path = abs_path.to_string_lossy().to_string();
+        let mut abs_path = abs_path.as_ref().to_string_lossy().to_string();
+        // If we start with `/~` that means the ssh path was something like `ssh://user@host/~/home-dir-folder/`
+        // in which case want to strip the leading the `/` and expand the tilde.
+        // That's what git does too: https://github.com/libgit2/libgit2/issues/3345#issuecomment-127050850
+        if abs_path.starts_with("/~") {
+            abs_path = shellexpand::tilde(&abs_path[1..]).to_string();
+        }
+        let root_name = PathBuf::from(abs_path.clone())
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         cx.spawn(|this, mut cx| async move {
             let response = client
                 .request(proto::AddWorktree {
                     project_id: SSH_PROJECT_ID,
-                    path: path.clone(),
+                    path: abs_path.clone(),
                 })
                 .await?;
             let worktree = cx.update(|cx| {
@@ -201,7 +209,7 @@ impl WorktreeStore {
                         id: response.worktree_id,
                         root_name,
                         visible,
-                        abs_path: path,
+                        abs_path,
                     },
                     client,
                     cx,
@@ -549,7 +557,7 @@ impl WorktreeStore {
                 drop(filters);
             })
             .detach();
-        return matching_paths_rx;
+        matching_paths_rx
     }
 
     fn scan_ignored_dir<'a>(
@@ -562,7 +570,7 @@ impl WorktreeStore {
         output_tx: &'a Sender<oneshot::Receiver<ProjectPath>>,
     ) -> BoxFuture<'a, Result<()>> {
         async move {
-            let abs_path = snapshot.abs_path().join(&path);
+            let abs_path = snapshot.abs_path().join(path);
             let Some(mut files) = fs
                 .read_dir(&abs_path)
                 .await

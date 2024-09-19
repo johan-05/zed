@@ -149,7 +149,8 @@ pub async fn post_crash(
         installation_id = %installation_id,
         description = %description,
         backtrace = %summary,
-        "crash report");
+        "crash report"
+    );
 
     if let Some(slack_panics_webhook) = app.config.slack_panics_webhook.clone() {
         let payload = slack::WebhookBody::new(|w| {
@@ -397,7 +398,7 @@ pub async fn post_events(
         match &wrapper.event {
             Event::Editor(event) => to_upload.editor_events.push(EditorEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 country_code.clone(),
@@ -410,7 +411,7 @@ pub async fn post_events(
                     .inline_completion_events
                     .push(InlineCompletionEventRow::from_event(
                         event.clone(),
-                        &wrapper,
+                        wrapper,
                         &request_body,
                         first_event_at,
                         country_code.clone(),
@@ -419,7 +420,7 @@ pub async fn post_events(
             }
             Event::Call(event) => to_upload.call_events.push(CallEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
@@ -429,7 +430,7 @@ pub async fn post_events(
                     .assistant_events
                     .push(AssistantEventRow::from_event(
                         event.clone(),
-                        &wrapper,
+                        wrapper,
                         &request_body,
                         first_event_at,
                         checksum_matched,
@@ -437,42 +438,42 @@ pub async fn post_events(
             }
             Event::Cpu(event) => to_upload.cpu_events.push(CpuEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
             )),
             Event::Memory(event) => to_upload.memory_events.push(MemoryEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
             )),
             Event::App(event) => to_upload.app_events.push(AppEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
             )),
             Event::Setting(event) => to_upload.setting_events.push(SettingEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
             )),
             Event::Edit(event) => to_upload.edit_events.push(EditEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
             )),
             Event::Action(event) => to_upload.action_events.push(ActionEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
@@ -486,7 +487,7 @@ pub async fn post_events(
                     .extension_events
                     .push(ExtensionEventRow::from_event(
                         event.clone(),
-                        &wrapper,
+                        wrapper,
                         &request_body,
                         metadata,
                         first_event_at,
@@ -495,7 +496,7 @@ pub async fn post_events(
             }
             Event::Repl(event) => to_upload.repl_events.push(ReplEventRow::from_event(
                 event.clone(),
-                &wrapper,
+                wrapper,
                 &request_body,
                 first_event_at,
                 checksum_matched,
@@ -627,7 +628,9 @@ where
 
 #[derive(Serialize, Debug, clickhouse::Row)]
 pub struct EditorEventRow {
+    system_id: String,
     installation_id: String,
+    session_id: Option<String>,
     metrics_id: String,
     operation: String,
     app_version: String,
@@ -647,7 +650,6 @@ pub struct EditorEventRow {
     historical_event: bool,
     architecture: String,
     is_staff: Option<bool>,
-    session_id: Option<String>,
     major: Option<i32>,
     minor: Option<i32>,
     patch: Option<i32>,
@@ -677,9 +679,10 @@ impl EditorEventRow {
             os_name: body.os_name.clone(),
             os_version: body.os_version.clone().unwrap_or_default(),
             architecture: body.architecture.clone(),
+            system_id: body.system_id.clone().unwrap_or_default(),
             installation_id: body.installation_id.clone().unwrap_or_default(),
-            metrics_id: body.metrics_id.clone().unwrap_or_default(),
             session_id: body.session_id.clone(),
+            metrics_id: body.metrics_id.clone().unwrap_or_default(),
             is_staff: body.is_staff,
             time: time.timestamp_millis(),
             operation: event.operation,
@@ -699,6 +702,7 @@ impl EditorEventRow {
 #[derive(Serialize, Debug, clickhouse::Row)]
 pub struct InlineCompletionEventRow {
     installation_id: String,
+    session_id: Option<String>,
     provider: String,
     suggestion_accepted: bool,
     app_version: String,
@@ -713,7 +717,6 @@ pub struct InlineCompletionEventRow {
     city: String,
     time: i64,
     is_staff: Option<bool>,
-    session_id: Option<String>,
     major: Option<i32>,
     minor: Option<i32>,
     patch: Option<i32>,
@@ -834,6 +837,7 @@ pub struct AssistantEventRow {
     // AssistantEventRow
     conversation_id: String,
     kind: String,
+    phase: String,
     model: String,
     response_latency_in_ms: Option<i64>,
     error_message: Option<String>,
@@ -866,6 +870,7 @@ impl AssistantEventRow {
             time: time.timestamp_millis(),
             conversation_id: event.conversation_id.unwrap_or_default(),
             kind: event.kind.to_string(),
+            phase: event.phase.to_string(),
             model: event.model,
             response_latency_in_ms: event
                 .response_latency
@@ -877,7 +882,9 @@ impl AssistantEventRow {
 
 #[derive(Debug, clickhouse::Row, Serialize)]
 pub struct CpuEventRow {
+    system_id: Option<String>,
     installation_id: Option<String>,
+    session_id: Option<String>,
     is_staff: Option<bool>,
     usage_as_percentage: f32,
     core_count: u32,
@@ -886,7 +893,6 @@ pub struct CpuEventRow {
     os_name: String,
     os_version: String,
     time: i64,
-    session_id: Option<String>,
     // pub normalized_cpu_usage: f64, MATERIALIZED
     major: Option<i32>,
     minor: Option<i32>,
@@ -915,6 +921,7 @@ impl CpuEventRow {
             release_channel: body.release_channel.clone().unwrap_or_default(),
             os_name: body.os_name.clone(),
             os_version: body.os_version.clone().unwrap_or_default(),
+            system_id: body.system_id.clone(),
             installation_id: body.installation_id.clone(),
             session_id: body.session_id.clone(),
             is_staff: body.is_staff,
@@ -938,6 +945,7 @@ pub struct MemoryEventRow {
     os_version: String,
 
     // ClientEventBase
+    system_id: Option<String>,
     installation_id: Option<String>,
     session_id: Option<String>,
     is_staff: Option<bool>,
@@ -969,6 +977,7 @@ impl MemoryEventRow {
             release_channel: body.release_channel.clone().unwrap_or_default(),
             os_name: body.os_name.clone(),
             os_version: body.os_version.clone().unwrap_or_default(),
+            system_id: body.system_id.clone(),
             installation_id: body.installation_id.clone(),
             session_id: body.session_id.clone(),
             is_staff: body.is_staff,
@@ -992,6 +1001,7 @@ pub struct AppEventRow {
     os_version: String,
 
     // ClientEventBase
+    system_id: Option<String>,
     installation_id: Option<String>,
     session_id: Option<String>,
     is_staff: Option<bool>,
@@ -1022,6 +1032,7 @@ impl AppEventRow {
             release_channel: body.release_channel.clone().unwrap_or_default(),
             os_name: body.os_name.clone(),
             os_version: body.os_version.clone().unwrap_or_default(),
+            system_id: body.system_id.clone(),
             installation_id: body.installation_id.clone(),
             session_id: body.session_id.clone(),
             is_staff: body.is_staff,
@@ -1044,6 +1055,7 @@ pub struct SettingEventRow {
     os_version: String,
 
     // ClientEventBase
+    system_id: Option<String>,
     installation_id: Option<String>,
     session_id: Option<String>,
     is_staff: Option<bool>,
@@ -1074,6 +1086,7 @@ impl SettingEventRow {
             release_channel: body.release_channel.clone().unwrap_or_default(),
             os_name: body.os_name.clone(),
             os_version: body.os_version.clone().unwrap_or_default(),
+            system_id: body.system_id.clone(),
             installation_id: body.installation_id.clone(),
             session_id: body.session_id.clone(),
             is_staff: body.is_staff,
@@ -1097,6 +1110,7 @@ pub struct ExtensionEventRow {
     os_version: String,
 
     // ClientEventBase
+    system_id: Option<String>,
     installation_id: Option<String>,
     session_id: Option<String>,
     is_staff: Option<bool>,
@@ -1132,6 +1146,7 @@ impl ExtensionEventRow {
             release_channel: body.release_channel.clone().unwrap_or_default(),
             os_name: body.os_name.clone(),
             os_version: body.os_version.clone().unwrap_or_default(),
+            system_id: body.system_id.clone(),
             installation_id: body.installation_id.clone(),
             session_id: body.session_id.clone(),
             is_staff: body.is_staff,
@@ -1222,6 +1237,7 @@ pub struct EditEventRow {
     os_version: String,
 
     // ClientEventBase
+    system_id: Option<String>,
     installation_id: Option<String>,
     // Note: This column name has a typo in the ClickHouse table.
     #[serde(rename = "sesssion_id")]
@@ -1259,6 +1275,7 @@ impl EditEventRow {
             release_channel: body.release_channel.clone().unwrap_or_default(),
             os_name: body.os_name.clone(),
             os_version: body.os_version.clone().unwrap_or_default(),
+            system_id: body.system_id.clone(),
             installation_id: body.installation_id.clone(),
             session_id: body.session_id.clone(),
             is_staff: body.is_staff,
@@ -1326,13 +1343,11 @@ impl ActionEventRow {
 }
 
 pub fn calculate_json_checksum(app: Arc<AppState>, json: &impl AsRef<[u8]>) -> Option<Vec<u8>> {
-    let Some(checksum_seed) = app.config.zed_client_checksum_seed.as_ref() else {
-        return None;
-    };
+    let checksum_seed = app.config.zed_client_checksum_seed.as_ref()?;
 
     let mut summer = Sha256::new();
     summer.update(checksum_seed);
-    summer.update(&json);
+    summer.update(json);
     summer.update(checksum_seed);
     Some(summer.finalize().into_iter().collect())
 }

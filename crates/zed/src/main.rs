@@ -11,9 +11,9 @@ use assistant::PromptBuilder;
 use chrono::Offset;
 use clap::{command, Parser};
 use cli::FORCE_CLI_MODE_ENV_VAR_NAME;
-use client::{parse_zed_link, Client, DevServerToken, UserStore};
+use client::{parse_zed_link, Client, DevServerToken, ProxySettings, UserStore};
 use collab_ui::channel_view::ChannelView;
-use db::kvp::KEY_VALUE_STORE;
+use db::kvp::{GLOBAL_KEY_VALUE_STORE, KEY_VALUE_STORE};
 use editor::Editor;
 use env_logger::Builder;
 use fs::{Fs, RealFs};
@@ -23,7 +23,8 @@ use gpui::{
     Action, App, AppContext, AsyncAppContext, Context, DismissEvent, Global, Task,
     UpdateGlobal as _, VisualContext,
 };
-use image_viewer;
+use http_client::{read_proxy_from_env, Uri};
+use isahc_http_client::IsahcHttpClient;
 use language::LanguageRegistry;
 use log::LevelFilter;
 
@@ -268,7 +269,6 @@ fn init_ui(
     welcome::init(cx);
     settings_ui::init(cx);
     extensions_ui::init(cx);
-    performance::init(cx);
 
     cx.observe_global::<SettingsStore>({
         let languages = app_state.languages.clone();
@@ -318,7 +318,6 @@ fn init_ui(
 }
 
 fn main() {
-    let start_time = std::time::Instant::now();
     menu::init();
     zed_actions::init();
 
@@ -330,23 +329,22 @@ fn main() {
     init_logger();
 
     log::info!("========== starting zed ==========");
+
     let app = App::new()
         .with_assets(Assets)
-        .measure_time_to_first_window_draw(start_time);
+        .with_http_client(IsahcHttpClient::new(None, None));
 
-    let (installation_id, existing_installation_id_found) = app
-        .background_executor()
-        .block(installation_id())
-        .ok()
-        .unzip();
-
+    let system_id = app.background_executor().block(system_id()).ok();
+    let installation_id = app.background_executor().block(installation_id()).ok();
+    let session_id = Uuid::new_v4().to_string();
     let session = app.background_executor().block(Session::new());
-
     let app_version = AppVersion::init(env!("CARGO_PKG_VERSION"));
+
     reliability::init_panic_hook(
-        installation_id.clone(),
         app_version,
-        session.id().to_owned(),
+        system_id.as_ref().map(|id| id.to_string()),
+        installation_id.as_ref().map(|id| id.to_string()),
+        session_id.clone(),
     );
 
     let (open_listener, mut open_rx) = OpenListener::new();
@@ -405,16 +403,16 @@ fn main() {
         paths::keymap_file().clone(),
     );
 
-    let login_shell_env_loaded = if stdout_is_a_pty() {
-        Task::ready(())
-    } else {
-        app.background_executor().spawn(async {
-            #[cfg(unix)]
-            {
-                load_shell_from_passwd().await.log_err();
-            }
-            load_login_shell_environment().await.log_err();
-        })
+    if !stdout_is_a_pty() {
+        app.background_executor()
+            .spawn(async {
+                #[cfg(unix)]
+                {
+                    load_shell_from_passwd().await.log_err();
+                }
+                load_login_shell_environment().await.log_err();
+            })
+            .detach()
     };
 
     app.on_open_urls({
@@ -441,6 +439,26 @@ fn main() {
         if let Some(build_sha) = option_env!("ZED_COMMIT_SHA") {
             AppCommitSha::set_global(AppCommitSha(build_sha.into()), cx);
         }
+        settings::init(cx);
+        client::init_settings(cx);
+        let user_agent = format!(
+            "Zed/{} ({}; {})",
+            AppVersion::global(cx),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        let proxy_str = ProxySettings::get_global(cx).proxy.to_owned();
+        let proxy_url = proxy_str
+            .as_ref()
+            .and_then(|input| {
+                input
+                    .parse::<Uri>()
+                    .inspect_err(|e| log::error!("Error parsing proxy settings: {}", e))
+                    .ok()
+            })
+            .or_else(read_proxy_from_env);
+        let http = IsahcHttpClient::new(proxy_url, Some(user_agent));
+        cx.set_http_client(http);
 
         <dyn Fs>::set_global(fs.clone(), cx);
 
@@ -449,15 +467,12 @@ fn main() {
 
         OpenListener::set_global(cx, open_listener.clone());
 
-        settings::init(cx);
         handle_settings_file_changes(user_settings_file_rx, cx, handle_settings_changed);
         handle_keymap_file_changes(user_keymap_file_rx, cx, handle_keymap_changed);
 
-        client::init_settings(cx);
         let client = Client::production(cx);
         cx.set_http_client(client.http_client().clone());
-        let mut languages =
-            LanguageRegistry::new(login_shell_env_loaded, cx.background_executor().clone());
+        let mut languages = LanguageRegistry::new(cx.background_executor().clone());
         languages.set_language_server_download_dir(paths::languages_dir().clone());
         let languages = Arc::new(languages);
         let node_runtime = RealNodeRuntime::new(client.http_client());
@@ -474,14 +489,26 @@ fn main() {
         client::init(&client, cx);
         language::init(cx);
         let telemetry = client.telemetry();
-        telemetry.start(installation_id.clone(), session.id().to_owned(), cx);
-        telemetry.report_app_event(
-            match existing_installation_id_found {
-                Some(false) => "first open",
-                _ => "open",
-            }
-            .to_string(),
+        telemetry.start(
+            system_id.as_ref().map(|id| id.to_string()),
+            installation_id.as_ref().map(|id| id.to_string()),
+            session_id,
+            cx,
         );
+        if let (Some(system_id), Some(installation_id)) = (&system_id, &installation_id) {
+            match (&system_id, &installation_id) {
+                (IdType::New(_), IdType::New(_)) => {
+                    telemetry.report_app_event("first open".to_string());
+                    telemetry.report_app_event("first open for release channel".to_string());
+                }
+                (IdType::Existing(_), IdType::New(_)) => {
+                    telemetry.report_app_event("first open for release channel".to_string());
+                }
+                (_, IdType::Existing(_)) => {
+                    telemetry.report_app_event("open".to_string());
+                }
+            }
+        }
         let app_session = cx.new_model(|cx| AppSession::new(session, cx));
 
         let app_state = Arc::new(AppState {
@@ -497,7 +524,11 @@ fn main() {
         AppState::set_global(Arc::downgrade(&app_state), cx);
 
         auto_update::init(client.http_client(), cx);
-        reliability::init(client.http_client(), installation_id, cx);
+        reliability::init(
+            client.http_client(),
+            installation_id.clone().map(|id| id.to_string()),
+            cx,
+        );
         let prompt_builder = init_common(app_state.clone(), cx);
 
         let args = Args::parse();
@@ -728,17 +759,33 @@ fn handle_open_request(
 async fn authenticate(client: Arc<Client>, cx: &AsyncAppContext) -> Result<()> {
     if stdout_is_a_pty() {
         if *client::ZED_DEVELOPMENT_AUTH {
-            client.authenticate_and_connect(true, &cx).await?;
+            client.authenticate_and_connect(true, cx).await?;
         } else if client::IMPERSONATE_LOGIN.is_some() {
-            client.authenticate_and_connect(false, &cx).await?;
+            client.authenticate_and_connect(false, cx).await?;
         }
-    } else if client.has_credentials(&cx).await {
-        client.authenticate_and_connect(true, &cx).await?;
+    } else if client.has_credentials(cx).await {
+        client.authenticate_and_connect(true, cx).await?;
     }
     Ok::<_, anyhow::Error>(())
 }
 
-async fn installation_id() -> Result<(String, bool)> {
+async fn system_id() -> Result<IdType> {
+    let key_name = "system_id".to_string();
+
+    if let Ok(Some(system_id)) = GLOBAL_KEY_VALUE_STORE.read_kvp(&key_name) {
+        return Ok(IdType::Existing(system_id));
+    }
+
+    let system_id = Uuid::new_v4().to_string();
+
+    GLOBAL_KEY_VALUE_STORE
+        .write_kvp(key_name, system_id.clone())
+        .await?;
+
+    Ok(IdType::New(system_id))
+}
+
+async fn installation_id() -> Result<IdType> {
     let legacy_key_name = "device_id".to_string();
     let key_name = "installation_id".to_string();
 
@@ -748,11 +795,11 @@ async fn installation_id() -> Result<(String, bool)> {
             .write_kvp(key_name, installation_id.clone())
             .await?;
         KEY_VALUE_STORE.delete_kvp(legacy_key_name).await?;
-        return Ok((installation_id, true));
+        return Ok(IdType::Existing(installation_id));
     }
 
     if let Ok(Some(installation_id)) = KEY_VALUE_STORE.read_kvp(&key_name) {
-        return Ok((installation_id, true));
+        return Ok(IdType::Existing(installation_id));
     }
 
     let installation_id = Uuid::new_v4().to_string();
@@ -761,7 +808,7 @@ async fn installation_id() -> Result<(String, bool)> {
         .write_kvp(key_name, installation_id.clone())
         .await?;
 
-    Ok((installation_id, false))
+    Ok(IdType::New(installation_id))
 }
 
 async fn restore_or_create_workspace(
@@ -1070,6 +1117,20 @@ struct Args {
     dev_server_token: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+enum IdType {
+    New(String),
+    Existing(String),
+}
+
+impl ToString for IdType {
+    fn to_string(&self) -> String {
+        match self {
+            IdType::New(id) | IdType::Existing(id) => id.clone(),
+        }
+    }
+}
+
 fn parse_url_arg(arg: &str, cx: &AppContext) -> Result<String> {
     match std::fs::canonicalize(Path::new(&arg)) {
         Ok(path) => Ok(format!(
@@ -1080,9 +1141,8 @@ fn parse_url_arg(arg: &str, cx: &AppContext) -> Result<String> {
             if arg.starts_with("file://")
                 || arg.starts_with("zed-cli://")
                 || arg.starts_with("ssh://")
+                || parse_zed_link(arg, cx).is_some()
             {
-                Ok(arg.into())
-            } else if let Some(_) = parse_zed_link(&arg, cx) {
                 Ok(arg.into())
             } else {
                 Err(anyhow!("error parsing path argument: {}", error))
@@ -1141,7 +1201,7 @@ fn load_user_themes_in_background(fs: Arc<dyn fs::Fs>, cx: &mut AppContext) {
                     }
                 }
                 theme_registry.load_user_themes(themes_dir, fs).await?;
-                cx.update(|cx| ThemeSettings::reload_current_theme(cx))?;
+                cx.update(ThemeSettings::reload_current_theme)?;
             }
             anyhow::Ok(())
         }
@@ -1158,18 +1218,17 @@ fn watch_themes(fs: Arc<dyn fs::Fs>, cx: &mut AppContext) {
             .await;
 
         while let Some(paths) = events.next().await {
-            for path in paths {
-                if fs.metadata(&path).await.ok().flatten().is_some() {
+            for event in paths {
+                if fs.metadata(&event.path).await.ok().flatten().is_some() {
                     if let Some(theme_registry) =
                         cx.update(|cx| ThemeRegistry::global(cx).clone()).log_err()
                     {
                         if let Some(()) = theme_registry
-                            .load_user_theme(&path, fs.clone())
+                            .load_user_theme(&event.path, fs.clone())
                             .await
                             .log_err()
                         {
-                            cx.update(|cx| ThemeSettings::reload_current_theme(cx))
-                                .log_err();
+                            cx.update(ThemeSettings::reload_current_theme).log_err();
                         }
                     }
                 }
@@ -1194,8 +1253,10 @@ fn watch_languages(fs: Arc<dyn fs::Fs>, languages: Arc<LanguageRegistry>, cx: &m
     cx.spawn(|_| async move {
         let (mut events, _) = fs.watch(path.as_path(), Duration::from_millis(100)).await;
         while let Some(event) = events.next().await {
-            let has_language_file = event.iter().any(|path| {
-                path.extension()
+            let has_language_file = event.iter().any(|event| {
+                event
+                    .path
+                    .extension()
                     .map(|ext| ext.to_string_lossy().as_ref() == "scm")
                     .unwrap_or(false)
             });

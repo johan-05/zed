@@ -13,9 +13,9 @@ use futures::{
 };
 use gpui::{AppContext, AsyncAppContext, Model, SemanticVersion};
 use parking_lot::Mutex;
-use rpc::proto::{
-    self, build_typed_envelope, EntityMessageSubscriber, Envelope, EnvelopedMessage, PeerId,
-    ProtoClient, ProtoMessageHandlerSet, RequestMessage,
+use rpc::{
+    proto::{self, build_typed_envelope, Envelope, EnvelopedMessage, PeerId, RequestMessage},
+    EntityMessageSubscriber, ProtoClient, ProtoMessageHandlerSet, RpcError,
 };
 use smol::{
     fs,
@@ -41,11 +41,11 @@ pub struct SshSocket {
 
 pub struct SshSession {
     next_message_id: AtomicU32,
-    response_channels: ResponseChannels,
+    response_channels: ResponseChannels, // Lock
     outgoing_tx: mpsc::UnboundedSender<Envelope>,
     spawn_process_tx: mpsc::UnboundedSender<SpawnRequest>,
     client_socket: Option<SshSocket>,
-    state: Mutex<ProtoMessageHandlerSet>,
+    state: Mutex<ProtoMessageHandlerSet>, // Lock
 }
 
 struct SshClientState {
@@ -156,9 +156,10 @@ impl SshSession {
         run_cmd(socket.ssh_command(&remote_binary_path).arg("version")).await?;
 
         let mut remote_server_child = socket
-            .ssh_command(&format!(
-                "RUST_LOG={} {:?} run",
-                std::env::var("RUST_LOG").unwrap_or(String::new()),
+            .ssh_command(format!(
+                "RUST_LOG={} RUST_BACKTRACE={} {:?} run",
+                std::env::var("RUST_LOG").unwrap_or_default(),
+                std::env::var("RUST_BACKTRACE").unwrap_or_default(),
                 remote_binary_path,
             ))
             .spawn()
@@ -241,7 +242,7 @@ impl SshSession {
                                     let line_ix = start_ix + ix;
                                     let content = &stderr_buffer[start_ix..line_ix];
                                     start_ix = line_ix + 1;
-                                    if let Ok(record) = serde_json::from_slice::<LogRecord>(&content) {
+                                    if let Ok(record) = serde_json::from_slice::<LogRecord>(content) {
                                         record.log(log::logger())
                                     } else {
                                         eprintln!("(remote) {}", String::from_utf8_lossy(content));
@@ -349,7 +350,7 @@ impl SshSession {
                                 }
                                 Err(error) => {
                                     log::error!(
-                                        "error handling message. type:{type_name}, error:{error:?}",
+                                        "error handling message. type:{type_name}, error:{error}",
                                     );
                                 }
                             }
@@ -371,7 +372,7 @@ impl SshSession {
         payload: T,
     ) -> impl 'static + Future<Output = Result<T::Response>> {
         log::debug!("ssh request start. name:{}", T::NAME);
-        let response = self.request_dynamic(payload.into_envelope(0, None, None), "");
+        let response = self.request_dynamic(payload.into_envelope(0, None, None), T::NAME);
         async move {
             let response = response.await?;
             log::debug!("ssh request finish. name:{}", T::NAME);
@@ -388,15 +389,21 @@ impl SshSession {
     pub fn request_dynamic(
         &self,
         mut envelope: proto::Envelope,
-        _request_type: &'static str,
+        type_name: &'static str,
     ) -> impl 'static + Future<Output = Result<proto::Envelope>> {
         envelope.id = self.next_message_id.fetch_add(1, SeqCst);
         let (tx, rx) = oneshot::channel();
-        self.response_channels
-            .lock()
-            .insert(MessageId(envelope.id), tx);
+        let mut response_channels_lock = self.response_channels.lock();
+        response_channels_lock.insert(MessageId(envelope.id), tx);
+        drop(response_channels_lock);
         self.outgoing_tx.unbounded_send(envelope).ok();
-        async move { Ok(rx.await.context("connection lost")?.0) }
+        async move {
+            let response = rx.await.context("connection lost")?.0;
+            if let Some(proto::envelope::Payload::Error(error)) = &response.payload {
+                return Err(RpcError::from_proto(error, type_name));
+            }
+            Ok(response)
+        }
     }
 
     pub fn send_dynamic(&self, mut envelope: proto::Envelope) -> Result<()> {
@@ -582,7 +589,7 @@ impl SshClientState {
         let mut server_binary_exists = false;
         if cfg!(not(debug_assertions)) {
             if let Ok(installed_version) =
-                run_cmd(self.socket.ssh_command(&dst_path).arg("version")).await
+                run_cmd(self.socket.ssh_command(dst_path).arg("version")).await
             {
                 if installed_version.trim() == version.to_string() {
                     server_binary_exists = true;
@@ -621,7 +628,7 @@ impl SshClientState {
             self.socket
                 .ssh_command("chmod")
                 .arg(format!("{:o}", server_mode))
-                .arg(&dst_path),
+                .arg(dst_path),
         )
         .await?;
 
@@ -660,8 +667,8 @@ impl SshClientState {
                     .map(|port| vec!["-P".to_string(), port.to_string()])
                     .unwrap_or_default(),
             )
-            .arg(&src_path)
-            .arg(&format!(
+            .arg(src_path)
+            .arg(format!(
                 "{}:{}",
                 self.socket.connection_options.scp_url(),
                 dest_path.display()
